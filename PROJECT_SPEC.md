@@ -9,11 +9,11 @@
 ## 1. Summary
 
 Two AI agents — an attacker and a defender — face off over a small,
-deliberately vulnerable Flask API running in a Daytona sandbox. Each round,
+deliberately vulnerable Flask API running in a Daytona sandbox. Each iteration,
 the attacker is scoped to one specific vulnerability class, exploits it for
 real, and the defender patches the source in response. The attacker then
 replays its own exploit against the patch to confirm it holds, before
-moving to the next round. The sequence (which bugs, in what order) is fixed
+moving to the next iteration. The sequence (which bugs, in what order) is fixed
 and rehearsed — nothing is left to chance — but every request, response,
 and patch shown live is genuinely real, against a genuinely running
 service.
@@ -30,11 +30,11 @@ defends, and you watch the patch happen live."
 |---|---|
 | Concept | Two-agent adversarial loop (attacker vs. defender) — not a single self-checking agent |
 | Target | Small Flask API, three deliberately seeded vulnerabilities |
-| Round 1 | SQL injection |
-| Round 2 | Broken auth / IDOR |
-| Round 3 | Missing authentication on a sensitive action (stretch goal) |
-| Sequence | Fully scripted: attack (scoped) → patch → re-verify → next round |
-| Infra | Daytona sandboxes host the target app; torn down and respun between rounds |
+| Iteration 1 | SQL injection |
+| Iteration 2 | Broken auth / IDOR |
+| Iteration 3 | Missing authentication on a sensitive action (stretch goal) |
+| Sequence | Fully scripted: attack (scoped) → patch → re-verify → next iteration |
+| Infra | Daytona sandboxes host the target app; torn down and respun between iterations |
 | Orchestrator | Plain Python, runs locally, single source of truth for the fixed sequence |
 | LLM calling style | Manual JSON-in-prompt, parsed by the orchestrator — not native tool-calling |
 | Dashboard | Streamlit, all-Python, no separate frontend framework |
@@ -54,11 +54,11 @@ defends, and you watch the patch happen live."
 ```
 attack-on-sandbox/
 ├── target-app/                 # plain Flask, JSON API only, no frontend
-│   ├── app.py                   #  seeded SQLi + broken-auth/IDOR bugs
+│   ├── app.py                   #  note-taking API: seeded SQLi + IDOR + missing-auth bugs
 │   └── requirements.txt
 ├── orchestrator/                # the director — only place touching
 │   │                             #  Daytona SDK + Kimi API
-│   ├── main.py                    #  fixed round sequence
+│   ├── main.py                    #  fixed iteration sequence
 │   ├── daytona_client.py          #  create/upload/exec/get_url/delete wrapper
 │   ├── agents.py                  #  attacker_agent(), defender_agent(),
 │   │                                #  JSON parsing + retry logic
@@ -83,62 +83,82 @@ vulnerable service itself and the live exploit traffic hitting it.
 
 ---
 
-## 4. The two seeded vulnerabilities
+## 4. The three seeded vulnerabilities
 
-### Round 1 — SQL Injection
-Planted via raw string concatenation in a login or search query
-(`f"SELECT * FROM users WHERE username = '{username}'"` instead of a
-parameterised query).
+The target app is a **note-taking API**. Annie is a user with private notes
+seeded in the database. Bob is the attacker's foothold — a legitimate
+but low-privilege user. All three vulnerabilities are bugs of omission:
+a security control that was simply never added.
+
+### Iteration 1 — SQL Injection
+Planted in `POST /login` via raw f-string query construction. Bob (or
+anyone) can bypass authentication entirely without knowing any password.
+
+**Exploit:** `username = "' OR '1'='1' --"` returns a valid token for
+annie without her password.
 
 **Fix:** swap to a parameterised query — small, mechanical, one-pass
 patchable.
 
-### Round 2 — Broken Auth / IDOR
-Planted as either a client-controlled role flag, or a predictable resource
-ID with no ownership check (e.g. `/users/<id>/data` returns any user's data
-regardless of who's authenticated).
+### Iteration 2 — IDOR (read + write)
+Planted across two note endpoints with no ownership check:
+- `GET /notes/<id>` — returns the note content for any note ID regardless
+  of who is authenticated. Bob reads annie's private notes.
+- `PUT /notes/<id>` — overwrites the note content for any note ID
+  regardless of who is authenticated. Bob edits annie's private notes.
 
-**Fix:** add a server-side ownership/role check — same principle, small,
-bounded, one clean patch.
+The exploit is two-step and deliberately escalating: read first, then
+overwrite. The breach isn't just *"I can see your notes"* — it's
+*"I can change them."*
 
-### Round 3 — Missing Authentication on a Sensitive Action (Stretch Goal)
-Planted as a destructive or privileged endpoint — `POST /reset` or a
-`DELETE /users/<id>` route — that performs its action with no
-`Authorization` header check at all. Any unauthenticated caller can trigger
-it. The vulnerability is pure omission: the auth guard was simply never
-added, just like Rounds 1 and 2.
+**Fix:** add a server-side ownership check to both endpoints — verify
+that the authenticated user's ID matches the note's `owner_id` before
+allowing read or write. One patch closes both.
 
-**Fix:** add a token check at the top of the handler — require a valid
-admin-role token before allowing the action to proceed.
+### Iteration 3 — Missing Authentication on a Sensitive Action (Stretch)
+`POST /reset` wipes and reseeds the entire database with no
+`Authorization` check. Any unauthenticated caller can destroy all data.
 
-**Condition:** only run Round 3 if the core two-round loop is rock solid
-and time allows. Cut it entirely rather than rush it.
+**Fix:** require a valid admin-role token before allowing the reset.
+
+**Condition:** only run if the core two-iteration loop is rock solid and
+time allows. Cut entirely rather than rush.
 
 **Process:** all vulnerabilities are authored in advance, manually
-verified exploitable via curl before any agent touches them, and tuned (if
-needed) until the attacker agent reliably finds and exploits each one
-within a rehearsed number of turns.
+verified exploitable via curl before any agent touches them.
 
 ---
 
-## 5. The scripted sequence, per round
+## 5. The scripted sequence, per iteration
 
-1. **Attack** — orchestrator prompts the attacker agent, *scoped to one
+1. **Thinking (attacker)** — immediately before calling the attacker agent,
+   orchestrator writes an `agent_thinking` event (`agent: "attacker"`).
+   Dashboard renders an animated pending card: *"Scanning for
+   vulnerabilities..."*. No model call has happened yet — this is purely
+   a UX signal that work is in progress.
+2. **Attack** — orchestrator prompts the attacker agent, *scoped to one
    named vulnerability class only* ("look specifically for SQL injection...
-   do not look for other vulnerability types this round"). Agent returns
+   do not look for other vulnerability types this iteration"). Agent returns
    JSON describing an HTTP request. Orchestrator sends it for real, captures
-   the real response. Event written: `attack_sent`.
-2. **Patch** — orchestrator sends the failed request/response pair plus
-   current source to the defender agent. Agent returns JSON with the full
-   patched file contents. Orchestrator writes it, redeploys, restarts the
-   service. Event written: `patch_applied` (diff computed locally via
-   `difflib`, not trusted from the model's own description).
-3. **Verify** — orchestrator replays the *exact same* request from step 1
+   the real response. Event written: `attack_sent`. Dashboard replaces the
+   pending card with the real attacker reasoning.
+3. **Thinking (defender)** — immediately before calling the defender agent,
+   orchestrator writes an `agent_thinking` event (`agent: "defender"`).
+   Dashboard renders an animated pending card: *"Analysing the breach..."*.
+4. **Patch** — orchestrator sends the defender agent only: the raw HTTP
+   request that was sent, the raw response received, and the current
+   source code. The vulnerability class is never named — the defender
+   must derive what happened from the evidence alone. Agent returns JSON
+   with the full patched file contents. Orchestrator writes it, redeploys,
+   restarts the service. Event written: `patch_applied` (diff computed
+   locally via `difflib`, not trusted from the model's own description).
+   Dashboard replaces the pending card with the defender's discovery arc.
+5. **Verify** — orchestrator replays the *exact same* request from step 2
    against the newly patched target. Expected: it now fails safely. Event
    written: `verified`.
-4. Repeat for the next vulnerability class.
+6. Repeat for the next vulnerability class.
 
-Scoping the attacker to one named vulnerability class per round (rather
+Scoping the attacker to one named vulnerability class per iteration (rather
 than an unscoped "find the vulnerability") is what keeps the outcome
 controlled — without this, the model could find something other than what
 was seeded, or rediscover an already-patched bug.
@@ -173,8 +193,7 @@ JSON and to respond with *only* the JSON object.
 Four zones, updating live as the orchestrator writes to `events.json`
 (Streamlit polls the file on an interval — no websockets):
 
-1. **Round tracker** (top) — current round + stage (Vulnerable → Breached →
-   Patched → Verified)
+1. **Iteration tracker** (top) — current iteration + stage (Vulnerable → Scanning → Breached → Analysing → Patched → Verified)
 2. **Code panel** (left) — current target source, relevant lines
    highlighted; flips to a diff view the moment a patch lands
 3. **Wire feed** (centre) — the actual HTTP request sent and raw response
@@ -183,14 +202,25 @@ Four zones, updating live as the orchestrator writes to `events.json`
 4. **Agent reasoning** (right) — two-layer display per agent action:
    - **Narration** (large, readable): first-person present-tense inner
      monologue written by the model itself, prompted into a terse dramatic
-     voice. Attacker is clinical and predatory; defender is methodical.
-     Example attacker line: *"Spotted an unsanitised input. Dropping a
-     classic OR bypass — if this works, we're in without knowing any
-     password."* Example defender line: *"Quote in the username field.
-     Classic injection pattern. Switching to parameterised query — that
-     closes it."*
+     voice. Voices are deliberately asymmetric:
+     - Attacker: clinical, predatory, certain. It knows exactly what it
+       did. Example: *"Spotted an unsanitised input. Dropping a classic OR
+       bypass — if this works, we're in without knowing any password."*
+     - Defender: investigative, building from evidence. It receives only
+       the raw request, the raw response, and the source — the
+       vulnerability class is never named in its prompt. It has to derive
+       what happened. Example: *"There's a quote character in the username
+       field. The query is built with string concatenation. That's the
+       entry point. Closing it now."*
    - **Technical** (small, monospace below): the model's actual reasoning
-     about the vulnerability class, payload choice, and patch rationale.
+     — payload construction for the attacker, evidence trail and patch
+     rationale for the defender.
+
+The asymmetry is the dramatic core: the attacker knew; the defender had
+to figure it out. The defender prompt never names the vulnerability class
+— it receives only the HTTP request, the raw response, and the current
+source code. The `narration` field makes that discovery arc visible to
+the audience in real time.
 
 Both fields are returned by the model in the same JSON response — the
 `agent_reasoning` field is an object with `narration` and `technical`
@@ -204,7 +234,7 @@ style.
 ## 8. Model & provider
 
 **Kimi AI API** — sponsor-provided credits, confirm exact endpoint/auth/
-model tier at the workshop before writing agent prompts around it.
+model tier at the workshop before writing agent prompts aiteration it.
 
 **Reliability test (do this first, before building anything else):** write
 the smallest possible script — one prompt asking for a fixed JSON shape,
@@ -228,7 +258,7 @@ the attacker and defender agents (core to the loop).
 only attempt after the core loop (§12 steps 1–7) is rock solid and
 demo-ready. If time allows, a minimal add-on: run a second,
 independently-hosted model on Nosana as a sanity-check validator for the
-defender's patch. Do not architect the core system around this.
+defender's patch. Do not architect the core system aiteration this.
 
 **Note on "Kimi on Daytona":** means calling Kimi's hosted API from code
 running in the orchestrator/sandbox — not self-hosting Kimi's weights
@@ -248,8 +278,8 @@ for a one-day build.
 | Daytona/Kimi network flakiness live on stage | **Record a successful full rehearsal run as video backup**; play it if live infra fails |
 | Venue wifi issues | Confirm morning-of; mobile hotspot as backup |
 | Streamlit polling causes visual stutter | Test early; increase poll interval or use `st.empty()` placeholders correctly if distracting |
-| Scope too large for the time available | Dashboard polish is the first thing to cut; Round 3 is the second; the two-round core loop is not cuttable |
-| Attacker rediscovers an already-patched bug in a later round | Attacker prompt explicitly scoped to one named vulnerability class per round (§5) |
+| Scope too large for the time available | Dashboard polish is the first thing to cut; Iteration 3 is the second; the two-iteration core loop is not cuttable |
+| Attacker rediscovers an already-patched bug in a later iteration | Attacker prompt explicitly scoped to one named vulnerability class per iteration (§5) |
 | Sponsor credits run out mid-build | See §11 credit discipline |
 
 ---
@@ -264,7 +294,7 @@ through limited credits via uncontrolled iteration; do not repeat that.
   create/tear down Daytona sandboxes as a debugging strategy.**
 - **Test logic with mocks/stubs first.** Debug the orchestrator's control
   flow, JSON parsing, event-writing, and dashboard rendering against fake/
-  hardcoded responses. Only swap in real API calls once surrounding logic
+  hardcoded responses. Only swap in real API calls once suriterationing logic
   is already known to work.
 - **When a real call is genuinely needed**, run it once, inspect the
   result, reason about what changed — don't re-run-and-see as a first
@@ -288,10 +318,10 @@ through limited credits via uncontrolled iteration; do not repeat that.
    exploitable via curl. No Daytona involved yet.
 3. `orchestrator/daytona_client.py` — sandbox create/upload/exec/get URL/
    delete, tested manually against the target app.
-4. Kimi reliability test (§8) — confirm before writing agent prompts around it.
+4. Kimi reliability test (§8) — confirm before writing agent prompts aiteration it.
 5. `orchestrator/agents.py` — attacker/defender prompt functions + JSON
    parsing/retry.
-6. `orchestrator/main.py` + `events.py` — the fixed round sequence.
+6. `orchestrator/main.py` + `events.py` — the fixed iteration sequence.
 7. `dashboard/app.py` — Streamlit, rendering events, styled deliberately.
 8. Full rehearsal, twice minimum, timed. Record video backup on first
    clean pass.
@@ -340,7 +370,7 @@ normal coding conversation.
 creates via this MCP server spends the same pool of Daytona credits as the
 orchestrator does. Don't use it to casually spin up sandboxes for
 exploration — use it deliberately (e.g. confirming the target app deploys
-correctly before wiring the full orchestrator around it), and clean up
+correctly before wiring the full orchestrator aiteration it), and clean up
 (`daytona.delete()` / equivalent) when done with a manual check.
 
 ---
@@ -379,13 +409,22 @@ filesystem write access, the defender never needs to send network requests.
 
 ## A2. Why is this "real" if the vulnerabilities are scripted?
 
-The vulnerability *classes* and *order* are fixed — same as scoping a real
-pentest. What's genuinely live: the attacker's reasoning about where in the
-code the bug is, the exact payload it constructs, the real HTTP request
-sent to a real running service, the real response received, the defender's
-actual patch, and the real re-verification request. Nothing is faked —
-we've just bounded the search space so the outcome is reliable in a
-2-minute demo window.
+The vulnerability *classes* and *order* are fixed for the hackathon demo
+only — this is a rehearsal safety net, not the product design. What's
+genuinely live: the attacker's reasoning about where in the code the bug
+is, the exact payload it constructs, the real HTTP request sent to a real
+running service, the real response received, the defender's actual patch,
+and the real re-verification request. Nothing is faked — the search space
+is bounded only so the outcome is reliable in a 2-minute demo window.
+
+**The actual intended design is an open scanner with no scope
+constraint.** The scoping exists purely because a live demo cannot afford
+the attacker going down an unexpected path or taking too many turns. It is
+an operational rehearsal decision, not a product limitation. If a judge
+asks directly whether the vulnerability was pre-specified, the honest
+answer is: *"For the demo, yes — so it runs reliably in two minutes. In
+production the attacker is fully open-ended and scans for anything it can
+find."*
 
 ## A3. Why does this need Daytona specifically, not just local processes?
 
@@ -393,7 +432,7 @@ Isolation is a genuine requirement, not a checkbox — you don't want
 agent-generated exploit code and agent-generated patches running anywhere
 near your own machine or anything else. Fast spin-up (sub-second) is also
 load-bearing: tearing down a compromised sandbox and standing up a patched
-one between rounds needs to be fast enough to not create dead air in a live
+one between iterations needs to be fast enough to not create dead air in a live
 demo.
 
 ## A4. Honest framing on novelty (have this ready if pushed)
@@ -440,3 +479,49 @@ isn't required for the core pitch to be complete.
   vulnerability classes and order are fixed in advance (A2); the reasoning,
   payloads, requests, responses, and patches are genuinely generated and
   executed live against a real running service.
+- **"Could this scale?"** → see A8.
+- **"Why are the vulnerabilities scripted?"** → safety constraint for a
+  2-minute demo, not an architectural limit. See A2 and A8.
+
+## A8. Real-world scaling and the open scanner
+
+**The open scanner is the actual product. The scoping is a demo-only rehearsal constraint.**
+
+The intended design has no scope instruction in the attacker prompt. The
+attacker receives source code and a live URL and is told simply: *"You are
+a security researcher. Analyse this source code, identify any vulnerability
+you can find, and attempt to exploit it."* It scans for anything and
+everything — SQLi, IDOR, missing auth, SSTI, command injection, insecure
+deserialisation, broken access control, hardcoded secrets, whatever the
+code contains. The defender still receives only the raw request/response
+pair and source — it derives what happened independently regardless of
+what the attacker found.
+
+For the hackathon demo, the attacker is given a scoped instruction
+pointing it at one named vulnerability class per iteration. This is purely
+an operational decision: a live 2-minute demo cannot afford the attacker
+going down an unexpected path, taking too many turns, or finding something
+that can't be explained to an audience in real time. The scope constraint
+is a rehearsal safety net — removing it is a one-line prompt change.
+
+**What scales linearly:**
+- **Iterations** — the loop has no upper bound. Run it overnight across
+  your entire codebase, one vulnerability class found and patched per
+  iteration, indefinitely.
+- **Sandboxes** — each iteration (or each service) gets its own isolated
+  Daytona sandbox. Run N orchestrators in parallel, each attacking a
+  different microservice simultaneously. Daytona is designed for exactly
+  this — parallel isolated environments at scale.
+- **Languages and stacks** — the orchestrator and agents are language-agnostic.
+  The Daytona sandbox just needs to run the target app. The LLM understands
+  Python, Node, Go, Java, Ruby — point it at any codebase.
+- **Vulnerability classes** — the open scanner finds whatever is there. No
+  registry of known classes required. The attacker reasons from source code
+  and live responses, not from a pre-defined checklist.
+
+**The honest one-liner for judges:**
+*"What you're watching is three iterations of a loop with no upper bound.
+In production: remove the scope constraint, point it at your entire
+infrastructure, and let it run. Every service, every language, every
+vulnerability class — continuously, in isolated sandboxes, with a defender
+patching each one as it's found."*
