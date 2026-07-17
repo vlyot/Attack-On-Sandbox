@@ -176,6 +176,25 @@ Judges may assume the dashboard is a pre-baked animation. Two built-in proof poi
 
 Optional (if time allows and screen real estate permits): open the Daytona web console in a split window during the demo — judges can watch the sandbox spin up and tear down live.
 
+### Live evidence tab (fourth tab, alongside main feed)
+A dedicated **"Live Proof"** tab that auto-fires a fixed HTTP request to the live sandbox URL at two moments:
+- **Before the patch** (`iteration_start` or `attack_sent` event) — runs the same GET against Annie's note, shows the raw unchecked response
+- **After the patch** (`verified` event) — runs the same request again, shows the 403 / error response
+
+Displayed as a before/after side-by-side panel with timestamps. No human input required — entirely driven by the event stream. The audience watches the same curl-equivalent request return different responses as the patch lands.
+
+**Implementation:** Python `requests` call from within the dashboard process, fired when the relevant event is received. The sandbox URL is pulled from the most recent `sandbox_ready` event. Not a real shell — just an HTTP client calling a hardcoded path (e.g. `GET /notes/1` with a pre-computed bob token) against the live URL.
+
+**What this proves to the audience:**
+- The sandbox URL is reachable by anyone, not just the orchestrator
+- The patch actually changed the app's behaviour, not just the source code display
+- Annie's data is real, the app is live, and the change happened exactly when the defender said it did
+
+### Dashboard is a window, not a control plane
+The dashboard is purely a visual layer for the demo — the agents run headlessly and autonomously with no human in the loop. The data pipeline is simple: the orchestrator writes newline-delimited JSON events to `events.json`, the dashboard polls and renders.
+
+Any other consumer of that file would work equally well: a terminal tail, a Slack bot, a Grafana panel, a custom web UI. The dashboard is not the product — it is a presentation tool for the judges. Anyone watching the demo could swap it for their own consumer by simply reading `events.json` and reacting to events however they prefer. The Daytona sandbox just returns HTTP responses; the Kimi calls just return JSON. The orchestrator is the only thing that matters architecturally.
+
 ### Animation reference (from HTML prototype)
 The prototype uses these patterns — replicate in Streamlit where possible:
 - Character-by-character typewriter reveal for narration text (22ms/char)

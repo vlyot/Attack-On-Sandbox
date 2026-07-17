@@ -190,7 +190,9 @@ JSON and to respond with *only* the JSON object.
 
 ## 7. Dashboard — what it shows
 
-Four zones, updating live as the orchestrator writes to `events.json`
+The dashboard is a presentation tool for the demo, not a control plane. The agents run headlessly and autonomously — no human interaction required. The data pipeline is simple: orchestrator writes newline-delimited JSON to `events.json`, dashboard polls and renders. Any other consumer of that stream (terminal tail, Slack bot, Grafana panel) would work identically — the Daytona sandbox just returns HTTP responses, the Kimi calls just return JSON. The dashboard exists to make what's happening legible to a live audience.
+
+Four zones plus a live evidence tab, updating as the orchestrator writes to `events.json`
 (Streamlit polls the file on an interval — no websockets):
 
 1. **Iteration tracker** (top) — current iteration + stage (Vulnerable → Scanning → Breached → Analysing → Patched → Verified)
@@ -228,6 +230,8 @@ subfields. The orchestrator writes both verbatim; no post-processing.
 The request/response pair shown in the wire feed must always be the real,
 live data — only the reasoning panel content is prompted into a specific
 style.
+
+**Live evidence tab:** a fifth panel that auto-fires the same HTTP request to the live sandbox URL at `iteration_start` and `verified` events, showing the before/after response side by side. No human input — the event stream drives it. Proves the patch actually changed the app's behaviour, not just the source code display.
 
 ---
 
@@ -525,3 +529,47 @@ In production: remove the scope constraint, point it at your entire
 infrastructure, and let it run. Every service, every language, every
 vulnerability class — continuously, in isolated sandboxes, with a defender
 patching each one as it's found."*
+
+## A9. Beyond the hackathon — native tool-calling and direct sandbox access
+
+The current implementation uses manual JSON parsing: the model returns a
+structured JSON object, the orchestrator interprets it and performs the
+action (HTTP request, file write, process restart) on the model's behalf.
+This works and is intentionally simple — but it is one step removed from
+what a deeper implementation could do.
+
+**The next level:** a model with reliable native tool-calling (function
+calling / tool use) could be given direct tools that operate on the Daytona
+sandbox itself:
+
+```
+tools = [
+    send_http_request(method, url, headers, body),
+    read_file(sandbox_id, path),
+    write_file(sandbox_id, path, content),
+    restart_process(sandbox_id, process_name),
+    run_command(sandbox_id, command),
+]
+```
+
+With this, the attacker doesn't return a JSON description of a request for
+the orchestrator to fire — it *fires the request itself*, reads the
+response, reasons about it, and decides the next move autonomously. The
+defender doesn't return a patched file for the orchestrator to write — it
+*writes directly into the sandbox*, restarts the service, and runs its own
+re-verification. The orchestrator becomes a thin harness: give the agent
+its tools and a goal, then observe.
+
+**Why we don't do this here:** native tool-calling reliability varies
+significantly across models, and sponsor-provided credits don't afford the
+multi-turn debugging loop this approach requires when it fails. The manual
+JSON approach gives us one clean call per agent action, predictable
+parsing, and a hard retry cap. It is deliberately conservative.
+
+**What it would take to implement:** a model with strong, consistent
+function-calling support (GPT-4o, Claude Sonnet/Opus, Gemini 1.5 Pro are
+the current reliable options as of mid-2026); the Daytona SDK exposed as
+callable tools; and a multi-turn agent loop rather than the current
+single-call-per-action pattern. The Daytona sandbox API already supports
+all the operations needed — the gap is purely on the model/orchestrator
+side.
