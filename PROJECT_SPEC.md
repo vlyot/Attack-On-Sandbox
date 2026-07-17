@@ -29,9 +29,10 @@ defends, and you watch the patch happen live."
 | Area | Decision |
 |---|---|
 | Concept | Two-agent adversarial loop (attacker vs. defender) — not a single self-checking agent |
-| Target | Small Flask API, two deliberately seeded vulnerabilities |
+| Target | Small Flask API, three deliberately seeded vulnerabilities |
 | Round 1 | SQL injection |
 | Round 2 | Broken auth / IDOR |
+| Round 3 | Missing authentication on a sensitive action (stretch goal) |
 | Sequence | Fully scripted: attack (scoped) → patch → re-verify → next round |
 | Infra | Daytona sandboxes host the target app; torn down and respun between rounds |
 | Orchestrator | Plain Python, runs locally, single source of truth for the fixed sequence |
@@ -100,7 +101,20 @@ regardless of who's authenticated).
 **Fix:** add a server-side ownership/role check — same principle, small,
 bounded, one clean patch.
 
-**Process:** both vulnerabilities are authored in advance, manually
+### Round 3 — Missing Authentication on a Sensitive Action (Stretch Goal)
+Planted as a destructive or privileged endpoint — `POST /reset` or a
+`DELETE /users/<id>` route — that performs its action with no
+`Authorization` header check at all. Any unauthenticated caller can trigger
+it. The vulnerability is pure omission: the auth guard was simply never
+added, just like Rounds 1 and 2.
+
+**Fix:** add a token check at the top of the handler — require a valid
+admin-role token before allowing the action to proceed.
+
+**Condition:** only run Round 3 if the core two-round loop is rock solid
+and time allows. Cut it entirely rather than rush it.
+
+**Process:** all vulnerabilities are authored in advance, manually
 verified exploitable via curl before any agent touches them, and tuned (if
 needed) until the attacker agent reliably finds and exploits each one
 within a rehearsed number of turns.
@@ -166,12 +180,24 @@ Four zones, updating live as the orchestrator writes to `events.json`
 3. **Wire feed** (centre) — the actual HTTP request sent and raw response
    received, styled so a breach reads as alarming (red) and a blocked
    attempt reads as safe (green)
-4. **Agent reasoning** (right) — short-form summary of what each agent
-   decided and why, per action
+4. **Agent reasoning** (right) — two-layer display per agent action:
+   - **Narration** (large, readable): first-person present-tense inner
+     monologue written by the model itself, prompted into a terse dramatic
+     voice. Attacker is clinical and predatory; defender is methodical.
+     Example attacker line: *"Spotted an unsanitised input. Dropping a
+     classic OR bypass — if this works, we're in without knowing any
+     password."* Example defender line: *"Quote in the username field.
+     Classic injection pattern. Switching to parameterised query — that
+     closes it."*
+   - **Technical** (small, monospace below): the model's actual reasoning
+     about the vulnerability class, payload choice, and patch rationale.
 
-Narration/reasoning text can be lightly polished for clarity since the
-outcome is scripted — but the request/response pair shown must always be
-the real, live data.
+Both fields are returned by the model in the same JSON response — the
+`agent_reasoning` field is an object with `narration` and `technical`
+subfields. The orchestrator writes both verbatim; no post-processing.
+The request/response pair shown in the wire feed must always be the real,
+live data — only the reasoning panel content is prompted into a specific
+style.
 
 ---
 
@@ -222,8 +248,8 @@ for a one-day build.
 | Daytona/Kimi network flakiness live on stage | **Record a successful full rehearsal run as video backup**; play it if live infra fails |
 | Venue wifi issues | Confirm morning-of; mobile hotspot as backup |
 | Streamlit polling causes visual stutter | Test early; increase poll interval or use `st.empty()` placeholders correctly if distracting |
-| Scope too large for the time available | Dashboard is the first thing to cut if behind schedule; the live agent loop is not cuttable |
-| Attacker rediscovers an already-patched bug in round 2 | Attacker prompt explicitly scoped to one named vulnerability class per round (§5) |
+| Scope too large for the time available | Dashboard polish is the first thing to cut; Round 3 is the second; the two-round core loop is not cuttable |
+| Attacker rediscovers an already-patched bug in a later round | Attacker prompt explicitly scoped to one named vulnerability class per round (§5) |
 | Sponsor credits run out mid-build | See §11 credit discipline |
 
 ---

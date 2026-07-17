@@ -57,7 +57,7 @@ Maximum concurrency windows:
 - `GET /` — health check
 - `POST /login` — **VULN-1 (SQLi):** raw f-string query `f"SELECT * FROM users WHERE username = '{username}' AND password = '{password}'"`. Payload `' OR '1'='1' --` bypasses auth and returns alice's token.
 - `GET /users/<id>/data` — **VULN-2 (IDOR):** parameterised query (safe) but zero ownership check. Any valid token retrieves any user's full profile including SSN.
-- `POST /reset` — calls `init_db()`, drops and reseeds the DB. Used by the orchestrator between rounds.
+- `POST /reset` — calls `init_db()`, drops and reseeds the DB. **VULN-3 (stretch, missing auth):** no `Authorization` check at all — any unauthenticated caller can wipe the database. Fix (Round 3): require a valid admin-role token before allowing the action. The orchestrator uses a separate internal `POST /reset` call (with the admin token, post-patch) between rounds; before the patch, the attacker demonstrates unauthenticated access.
 
 **Token scheme:** `base64(str(user_id))` — trivially decodable, functional enough to drive the IDOR demo.
 
@@ -68,21 +68,23 @@ All 10 E2E cases passed against the running server:
 - Own-data access, no-token → 401, nonexistent user → 404
 - **IDOR:** bob's token + `/users/1/data` → alice's full profile including SSN ✅
 - Reset → re-login succeeds ✅
+- **Missing auth on `/reset`:** unauthenticated `POST /reset` succeeds — VULN-3 confirmed ✅ (stretch)
 
 ### Goal
-A minimal Flask JSON API with two deliberately seeded, manually-verified-exploitable vulnerabilities. No auth middleware, no ORM, no frontend — just endpoints returning JSON and a SQLite database. The bugs must be reliably triggerable via a single curl command before any agent touches them.
+A minimal Flask JSON API with three deliberately seeded, manually-verified-exploitable vulnerabilities (all bugs of omission). No auth middleware, no ORM, no frontend — just endpoints returning JSON and a SQLite database. The bugs must be reliably triggerable via a single curl command before any agent touches them.
 
 ### What to build
 - `GET /` — health check, returns `{"status": "ok"}`
 - `POST /login` — accepts `{"username": "...", "password": "..."}`, returns a JWT-style token on success. **Bug planted here:** raw f-string SQL query (`f"SELECT * FROM users WHERE username = '{username}'"`) instead of a parameterised query. A payload of `' OR '1'='1` on the username field must bypass authentication and return a valid token for any user.
 - `GET /users/<id>/data` — returns the profile data for user `<id>`. Requires the token from `/login` in the `Authorization` header. **Bug planted here:** the endpoint reads `<id>` from the URL and queries the database directly with no check that the authenticated user's ID matches the requested `<id>`. Any authenticated user can retrieve any other user's data.
-- SQLite database seeded on startup with at least two user rows (e.g. `alice` as admin, `bob` as regular user) with distinct profile data, so the IDOR exploit is visibly meaningful.
-- A `reset_db()` function that can be called to restore the database to its seeded state between rounds.
+- `POST /reset` — drops and reseeds the database. **Bug planted here:** no `Authorization` header check — any unauthenticated request triggers the wipe. (Stretch Round 3 target.)
+- SQLite database seeded on startup with at least two user rows (`alice` as admin, `bob` as regular user) with distinct profile data, so the IDOR exploit is visibly meaningful.
 
 ### Verification gate
 Before moving to Phase 3A, manually confirm:
 1. `POST /login` with `username = "' OR '1'='1"` returns a 200 with a token
 2. `GET /users/1/data` with bob's token (not alice's) returns alice's data
+3. `POST /reset` with no `Authorization` header returns 200 (stretch: confirms unauthenticated destructive access)
 
 ---
 
@@ -99,17 +101,23 @@ Define the single shared data contract that connects the orchestrator to the das
 Each event is one JSON object per line (newline-delimited JSON), with at minimum:
 - `type` — one of: `round_start`, `attack_sent`, `patch_applied`, `verified`, `round_complete`
 - `timestamp` — ISO 8601
-- `round` — integer (1 or 2)
-- `vulnerability_class` — `"sqli"` or `"idor"`
+- `round` — integer (1, 2, or 3)
+- `vulnerability_class` — `"sqli"`, `"idor"`, or `"missing_auth"`
 - `payload` — object whose shape varies by event type (see below)
 
 Event-specific payload shapes:
-- `attack_sent`: `{ request: {method, url, headers, body}, response: {status, body}, agent_reasoning: string }`
-- `patch_applied`: `{ diff: string, patched_source: string, agent_reasoning: string }` — diff computed by the orchestrator via `difflib`, not taken from the model
+- `attack_sent`: `{ request: {method, url, headers, body}, response: {status, body}, agent_reasoning: {narration: string, technical: string} }`
+- `patch_applied`: `{ diff: string, patched_source: string, agent_reasoning: {narration: string, technical: string} }` — diff computed by the orchestrator via `difflib`, not taken from the model
 - `verified`: `{ request: {…}, response: {…}, exploit_blocked: boolean }`
 
+**`agent_reasoning` is always a two-field object, never a plain string:**
+- `narration` — terse, first-person present-tense inner monologue written by the model, prompted into a dramatic voice. Attacker is clinical and predatory; defender is methodical. This is what the audience reads on the big panel.
+- `technical` — the model's actual reasoning about vulnerability class, payload choice, and patch rationale. Displayed in a smaller monospace block beneath the narration for judges who want depth.
+
+Both fields are returned verbatim from the model — no post-processing by the orchestrator. The prompt instructs the model to write `narration` in this specific style as part of the JSON shape it returns.
+
 ### Fixture file
-Hand-craft a complete `events.json` covering both rounds in sequence — two of each event type, with realistic-looking (but fake) payloads. This file is the only thing Phase 2B needs to develop against, so it should be complete and representative before the dashboard is started.
+Hand-craft a complete `events.json` covering all three rounds in sequence — one of each event type per round, with realistic-looking (but fake) payloads including both `narration` and `technical` subfields. This file is the only thing Phase 2B needs to develop against, so it should be complete and representative before the dashboard is started.
 
 ---
 
@@ -126,12 +134,15 @@ A Streamlit app that reads `events.json` on a polling interval and renders the c
 - **Top bar:** current round number + current stage label (`Vulnerable` / `Breached` / `Patched` / `Verified`), derived from the last event type seen
 - **Left panel — Code view:** display the current `target-app/app.py` source. When a `patch_applied` event arrives, switch to a diff view (additions in green, removals in red) computed from the event's `diff` field. Use `st.code()` with syntax highlighting.
 - **Centre panel — Wire feed:** for each `attack_sent` and `verified` event, show the HTTP method + URL + body sent, then the raw response status + body received. Style the block red if `exploit_blocked == false` (breach succeeded), green if `exploit_blocked == true` (patch held).
-- **Right panel — Agent reasoning:** for each agent action, show a compact card with the agent role (Attacker / Defender), the event type, and the `agent_reasoning` string from the event payload.
+- **Right panel — Agent reasoning:** for each agent action, show a compact card with:
+  - Agent role label (Attacker / Defender) and event type as a header
+  - `narration` text large and readable — this is what the audience watches
+  - `technical` text below in a small `st.code()` monospace block — for judges who want depth
 - **Polling:** use `st.rerun()` on a short interval (e.g. 2 seconds). Avoid re-reading the whole file unnecessarily — track the last event count and only process new lines.
 
 ### Polish (cuttable if time runs out)
 - Animate the stage label transition
-- Auto-scroll the wire feed to the latest event
+- Auto-scroll the wire feed and reasoning panel to the latest event
 - Show a "LIVE" badge while events are actively arriving
 
 ---
@@ -179,10 +190,10 @@ Write the smallest possible standalone script: one prompt asking the Kimi model 
 
 ### Functions to implement
 - `attacker_agent(app_url: str, vulnerability_class: str, source_code: str) -> dict`
-  Prompts Kimi with: the target URL, the source code, and a scoped instruction ("look specifically for `{vulnerability_class}` vulnerabilities only — do not look for other vulnerability types"). Expected return shape: `{ method, url, headers, body, agent_reasoning }`.
+  Prompts Kimi with: the target URL, the source code, and a scoped instruction ("look specifically for `{vulnerability_class}` vulnerabilities only — do not look for other vulnerability types"). Expected return shape: `{ method, url, headers, body, agent_reasoning: { narration, technical } }`. The prompt explicitly instructs the model to write `narration` in terse, first-person, present-tense style — clinical and predatory in voice.
 
 - `defender_agent(request: dict, response: dict, source_code: str) -> dict`
-  Prompts Kimi with: the failed request, the response that showed exploitation succeeded, and the current source. Expected return shape: `{ patched_source, agent_reasoning }`.
+  Prompts Kimi with: the failed request, the response that showed exploitation succeeded, and the current source. Expected return shape: `{ patched_source, agent_reasoning: { narration, technical } }`. The prompt instructs the model to write `narration` in a methodical, first-person voice — focused on what the evidence showed and what was done to close it.
 
 - `parse_model_json(raw_text: str) -> dict`
   Regex-extracts the first `{...}` block from the model's raw output. Handles common model quirks: JSON wrapped in markdown code fences, stray explanation text before/after the JSON block.
@@ -223,8 +234,11 @@ for each round in [sqli, idor]:
 ### What "locally" means here
 The orchestrator runs the target app as a subprocess (`subprocess.Popen`) for Phase 4 testing. Restarting means killing and re-spawning the subprocess. Phase 5 replaces this with Daytona calls.
 
+### Round 3 (stretch)
+The round sequence is defined as `[sqli, idor]` for the core build. Round 3 (`missing_auth`) is a list entry that's conditionally included — gated by a config flag so it's easy to enable once the two-round loop is solid. The round sequence and event schema already support it (see Phase 2A).
+
 ### Verification gate
-With mocks active and the local target app running, execute the full two-round sequence and confirm: all events are written to `events.json` in the correct order, the diff in `patch_applied` is non-empty, `exploit_blocked` is set correctly in `verified`, and the dashboard (Phase 2B) renders the full run correctly when pointed at the resulting `events.json`.
+With mocks active and the local target app running, execute the full two-round sequence and confirm: all events are written to `events.json` in the correct order, the diff in `patch_applied` is non-empty, `exploit_blocked` is set correctly in `verified`, `agent_reasoning` contains both `narration` and `technical` subfields in every agent event, and the dashboard (Phase 2B) renders the full run correctly when pointed at the resulting `events.json`.
 
 ---
 
