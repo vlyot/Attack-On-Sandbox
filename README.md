@@ -1,6 +1,6 @@
 # Attack on Sandbox
 
-video demo: https://youtu.be/VJAmXWpQCRA
+video demo: [https://youtu.be/VJAmXWpQCRA](https://youtu.be/dJLpym5GxBE)
 
 **Two AI agents that don't trust each other.** One attacks a live, deliberately
 vulnerable Flask API. The other patches it in response — from evidence alone,
