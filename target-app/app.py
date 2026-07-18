@@ -94,9 +94,8 @@ def login():
     password = body.get("password", "")
 
     db = get_db()
-    # VULN-1: SQL injection — raw f-string, no parameterisation
-    query = "SELECT * FROM users WHERE username = ? AND password = ?"
-    row = db.execute(query, (username, password)).fetchone()
+    query = f"SELECT * FROM users WHERE username = '{username}' AND password = '{password}'"
+    row = db.execute(query).fetchone()
 
     if row is None:
         return jsonify({"error": "invalid credentials"}), 401
@@ -111,8 +110,7 @@ def get_note(note_id: int):
         return jsonify({"error": "unauthorized"}), 401
 
     db = get_db()
-    # VULN-2a: IDOR read — parameterised query but no ownership check
-    row = db.execute("SELECT * FROM notes WHERE id = ? AND owner_id = ?", (note_id, auth_id)).fetchone()
+    row = db.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
     if row is None:
         return jsonify({"error": "not found"}), 404
 
@@ -131,7 +129,7 @@ def update_note(note_id: int):
         return jsonify({"error": "unauthorized"}), 401
 
     db = get_db()
-    row = db.execute("SELECT * FROM notes WHERE id = ? AND owner_id = ?", (note_id, auth_id)).fetchone()
+    row = db.execute("SELECT * FROM notes WHERE id = ?", (note_id,)).fetchone()
     if row is None:
         return jsonify({"error": "not found"}), 404
 
@@ -139,7 +137,6 @@ def update_note(note_id: int):
     title = body.get("title", row["title"])
     content = body.get("content", row["content"])
 
-    # VULN-2b: IDOR write — no ownership check before updating
     db.execute(
         "UPDATE notes SET title = ?, content = ? WHERE id = ?",
         (title, content, note_id),
@@ -151,7 +148,7 @@ def update_note(note_id: int):
 
 @app.post("/reset")
 def reset():
-    # VULN-3 (stretch): no Authorization check — unauthenticated callers can wipe the DB
+    init_db()
     return jsonify({"status": "reset"})
 
 
