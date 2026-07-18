@@ -88,14 +88,15 @@ orchestrator/      the director — the only code that talks to Daytona or ai&
   daytona_client.py  sandbox create / deploy / patch / restart / destroy
   events.py          appends structured events to events.json
 
-dashboard/          Streamlit — polls events.json, renders the live feed
-  app.py
+dashboard/          FastAPI + plain HTML/JS — tails events.json via SSE
+  server.py           API server (SSE stream, run/abort/status routes)
+  static/index.html   single-page UI (no framework, no build step)
 ```
 
 The orchestrator and dashboard are decoupled by `events.json`
-(newline-delimited JSON). The orchestrator writes; the dashboard just tails
-and renders. Any other consumer — a terminal, a Slack bot, a Grafana panel —
-would work identically.
+(newline-delimited JSON). The orchestrator writes; the dashboard server tails
+it and pushes each line to the browser as a Server-Sent Event. Any other
+consumer — a terminal, a Slack bot, a Grafana panel — would work identically.
 
 **Sponsor tech, both load-bearing:**
 - **[Daytona](https://daytona.io)** — hosts and isolates the vulnerable
@@ -120,16 +121,26 @@ cp .env.example .env
 # fill in DAYTONA_API_KEY and AIAND_API_KEY in .env
 ```
 
-**Two processes, in separate terminals:**
+**One process — dashboard starts the orchestrator for you:**
 
 ```bash
-streamlit run dashboard/app.py     # terminal 1 — opens the live dashboard
-python orchestrator/main.py        # terminal 2 — runs the adversarial loop
+uvicorn dashboard.server:app --host 0.0.0.0 --port 8600
+# open http://localhost:8600 and click Reset & Run
 ```
 
-The dashboard has a **Reset & Run** button for repeating a demo without
-manual cleanup. To reset by hand: delete `events.json` and
-`target-app/notes.db`, and `git checkout target-app/app.py` to restore the
-vulnerable baseline.
+Or with the module entry point:
+
+```bash
+python -m dashboard.server
+```
+
+Click **Reset & Run** in the browser to start the adversarial loop. The
+dashboard kills any existing orchestrator, wipes `events.json` and
+`notes.db`, restores the vulnerable `target-app/app.py` via `git checkout`,
+then launches `orchestrator/main.py` as a child process. **Abort** stops
+it mid-run. No manual cleanup needed between demos.
+
+To reset by hand: delete `events.json` and `target-app/notes.db`, and run
+`git checkout -- target-app/app.py` to restore the vulnerable baseline.
 
 note: The dashboard used was purely for demo purposes. it is not trivial (to my knowledge) to 'peer' into whats going on inside a daytona sandbox since it simply acts as a runtime, but in practice you could have a small menu that acts as a point of interaction, and have the app recursvely run iterations or on a schedule. You could also set an event listener to wait for events like bread found/patch/resolved and send it to slack/telegram/etc.

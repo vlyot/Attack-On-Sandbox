@@ -75,6 +75,15 @@ def reset_events_log() -> None:
         EVENTS_PATH.unlink()
 
 
+def reset_target_source() -> None:
+    """Restore target-app/app.py to the committed vulnerable baseline via git."""
+    subprocess.run(
+        ["git", "checkout", "--", str(APP_SOURCE_PATH)],
+        cwd=str(ROOT),
+        check=False,
+    )
+
+
 def reset_target_db() -> None:
     """Delete notes.db so each run starts from the seeded state."""
     if DB_PATH.exists():
@@ -175,6 +184,14 @@ def start_sandbox(emit_ready_event: bool = True) -> tuple[str, str]:
         sandbox_id = daytona_client.create_sandbox()
         daytona_client.deploy_app(sandbox_id, str(TARGET_APP_DIR))
         daytona_client.start_app(sandbox_id)
+    else:
+        # Pre-warmed sandbox: re-upload the clean source so any defender
+        # patches from a previous run don't carry over into this one.
+        clean_source = APP_SOURCE_PATH.read_text(encoding="utf-8")
+        daytona_client.upload_file(
+            sandbox_id, "/home/daytona/app/app.py", clean_source
+        )
+        daytona_client.restart_app(sandbox_id)
 
     url = daytona_client.get_url(sandbox_id)
 
@@ -387,6 +404,7 @@ def run_iteration(iteration: int, vulnerability_class: str, target: dict) -> Non
 
 def main() -> None:
     reset_events_log()
+    reset_target_source()
 
     if MOCK:
         reset_target_db()

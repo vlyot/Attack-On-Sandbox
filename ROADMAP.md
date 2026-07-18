@@ -689,3 +689,19 @@ Confirm the demo is reliable, timed, and has a video backup. Everything before t
 - Auto-scroll wire feed
 - "LIVE" badge
 - Nosana stretch integration (only if all the above is done with time remaining)
+
+### Streaming UX fix (post-Phase-5, July 2026) ✅ COMPLETE
+
+Four issues surfaced after the first live run with real ai& API calls and were fixed in `dashboard/app.py` only (no orchestrator changes):
+
+**Fix 1 — Raw JSON hidden.** `stream_chunk` events were displayed live as a scrolling JSON token stream while the model was generating. In practice deepseek emits JSON field-by-field so the audience saw garbage (e.g. `{"method": "POST", "url": ...`) for 10–30 seconds before the clean narration replaced it. Fix: `apply_event()` still consumes `stream_chunk` at the hot-path rate (so cursor mechanics are unchanged) but no longer accumulates into `attacker_raw_stream`/`defender_raw_stream` buffers — those state fields were removed entirely. `_feed_raw_stream_block()` was deleted. The live-timer block (real JS wall-clock, ticks between reruns) already proves liveness without showing garbage.
+
+**Fix 2 — Smooth auto-scroll.** The feed's `scrollIntoView` was using `behavior: "auto"`, causing the viewport to snap hard on every 250ms rerun. Changed to `behavior: "smooth"`.
+
+**Fix 3 — Gallery badge flashing.** Round gallery cards called `st.html()` on every rerun even when the stage hadn't changed, causing visible DOM replacement flicker during typewriter cycles. Added `_gallery_stage_cache` dict to session state; each card only re-emits HTML when its `f"{stage}:{active}"` cache key changes. Unchanged cards use `st.empty()` to hold the column position.
+
+**Fix 4 — Rerun pacing.** `_process_events_this_cycle()` now returns `(remaining, had_structural_event)`. `main()` only calls `st.rerun()` immediately when a structural event (anything other than `narration_chunk`/`stream_chunk`) landed; narration-only cycles sleep `POLL_INTERVAL_S` (raised from 80ms → 250ms) before rerunning. This means the typewriter accumulates 15 chars per 250ms frame instead of triggering a full feed DOM replacement for every single character.
+
+**Also fixed:** `target-app/app.py` had been accidentally committed in a partially-patched state (`5efd4b6 add demo (bad)`). The vulnerable baseline from `c2370fb` was restored — the `_ORIGINAL_*` handler strings in `agents.py`'s mock data must match the file exactly for `_patch_handler()` to do the string substitution that makes mock-mode patching work. Running `git checkout -- target-app/app.py` after each demo run is the correct reset procedure (also what `do_reset()` does).
+
+**Verified:** 111/111 tests pass. Live Playwright e2e confirmed: live-timer shows while agent is active → silently swallows all stream_chunk events (zero raw JSON ever visible) → narration typewriter replaces timer → full iteration renders (attacker narration, breach wire, taunt, defender narration, diff, exploit-blocked wire) with no flashing or DOM thrash.

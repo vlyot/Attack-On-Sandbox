@@ -1,3 +1,8 @@
+[server]
+enableStaticServing = true
+port = 8600
+fileWatcherType = "none"
+
 [theme]
 base = "light"
 backgroundColor = "#f3f2f2"

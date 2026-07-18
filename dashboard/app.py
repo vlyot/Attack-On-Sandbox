@@ -1,14 +1,12 @@
 """
 Attack on Sandbox — Streamlit dashboard.
 
-Reads newline-delimited JSON from events.json, updates session state on each
-poll, and renders a single vertical feed (nav bar + round gallery above it):
-  - Nav bar        (brand, Reset)
-  - Sidebar        (sticky: every sandbox this run has created, live + past)
-  - Round gallery  (3 iteration cards: numeral + stage, no endpoint)
-  - Feed           (narration -> wire -> taunt -> narration -> diff -> wire,
-                     in event order, styled after the project's HTML design
-                     reference)
+Architecture:
+  - Streamlit (Python) owns: sidebar sandbox roster, nav bar + round gallery,
+    Reset button, and session state for those low-frequency elements.
+  - The live feed is a self-contained HTML+JS iframe (st.iframe)
+    that polls events.json directly via fetch/Range requests and patches its
+    own DOM — zero Streamlit reruns touch the feed, so there is no flashing.
 """
 
 import json
@@ -24,8 +22,8 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 
 EVENTS_PATH = Path("events.json")
-POLL_INTERVAL_S = 0.08   # 80 ms between polls when idle
-MAX_EVENTS_PER_CYCLE = 50  # batch cap so UI stays responsive during fixture replay
+STATIC_EVENTS_PATH = Path(__file__).parent / "static" / "events.json"
+POLL_INTERVAL_S = 2.0   # Python-side poll — only updates sidebar/nav/gallery (iframe polls independently at 120ms)
 
 STAGE_COLORS = {
     "idle":      "#9b9797",
@@ -43,62 +41,73 @@ VULN_LABELS = {
     "missing_auth": "Missing Auth",
 }
 
-# Pre-scripted attacker taunts — authored theatre, never model-generated.
-# The defender never sees these; it receives only request + response + source.
 TAUNTS = {
     "sqli":         "Thanks for the login — didn't even need a password.",
     "idor":         "Appreciate Annie's notes — didn't need to be her to read them.",
     "missing_auth": "Reset's done — nobody even asked who I was.",
 }
 
+
+def _taunt_for(vuln_class: str) -> str:
+    return TAUNTS.get(vuln_class, "")
+
 # ---------------------------------------------------------------------------
 # State initialisation
 # ---------------------------------------------------------------------------
 
 _STATE_DEFAULTS: dict = {
-    "cursor":             0,
     "sandbox_url":        "",
     "sandbox_id":         "",
     "sandbox_region":     "",
     "sandbox_created_at":  "",
     "sandbox_spec":       {},
     "sandbox_status":     "idle",
-    # Every sandbox this run has created, in order — each entry a dict with
-    # id/url/region/created_at/status/iteration/vuln_class. The current
-    # sandbox_* fields above always mirror the last entry here; this list is
-    # what lets the sidebar show past sandboxes too, not just the live one.
     "sandbox_history":    [],
     "iteration":          0,
     "stage":              "idle",
     "vuln_class":         "",
-    "source_code":        "",
-    "diff":               "",
-    "wire_request":       None,
-    "wire_response":      None,
-    "wire_blocked":       None,
+    "active_agent":       None,
     "attacker_narration": "",
     "attacker_technical": "",
     "defender_narration": "",
     "defender_technical": "",
-    "attacker_raw_stream": "",
-    "defender_raw_stream": "",
+    "wire_request":       None,
+    "wire_response":      None,
+    "wire_blocked":       None,
+    "diff":               "",
     "llm_calls":           0,
     "llm_tokens":          0,
-    "active_agent":       None,
-    "active_agent_label": "",
-    "history":            [],
-    # True once the current iteration's blocks have been frozen into
-    # history at iteration_complete — stops render_feed() from also
-    # rendering them "live" until the next iteration_start clears it.
-    "_iteration_frozen":  False,
+    # Python-side byte cursor into events.json
+    "cursor":             0,
+    # Cache keys for sidebar and nav+gallery
+    "_sidebar_cache_key":   "",
+    "_sidebar_html_cache":  "",
+    "_nav_cache_key":       "",
+    "_nav_html_cache":      "",
 }
 
 
 def init_state() -> None:
     for key, default in _STATE_DEFAULTS.items():
         if key not in st.session_state:
-            # Copy mutable defaults so tests don't share the same object
-            st.session_state[key] = default.copy() if isinstance(default, (list, dict)) else default
+            st.session_state[key] = (
+                default.copy() if isinstance(default, (list, dict)) else default
+            )
+
+
+# ---------------------------------------------------------------------------
+# Sync events.json → dashboard/static/events.json
+# Streamlit serves dashboard/static/ at /app/static/ so the iframe JS can
+# fetch it without CORS issues.
+# ---------------------------------------------------------------------------
+
+def sync_events_file() -> None:
+    """Copy events.json to the static folder the iframe can fetch."""
+    STATIC_EVENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if EVENTS_PATH.exists():
+        STATIC_EVENTS_PATH.write_bytes(EVENTS_PATH.read_bytes())
+    elif STATIC_EVENTS_PATH.exists():
+        STATIC_EVENTS_PATH.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -110,11 +119,6 @@ TARGET_APP_DB = Path("target-app/notes.db")
 ORCHESTRATOR_SCRIPT = Path("orchestrator/main.py")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# _orchestrator_proc lives outside st.session_state: a subprocess.Popen isn't
-# JSON-serialisable and Streamlit's session_state persistence would choke on
-# it. A module-level global is safe here because a single Streamlit process
-# serves one dashboard instance in this project's usage (one presenter, one
-# demo run) — this is not a multi-user web app.
 _orchestrator_proc: subprocess.Popen | None = None
 
 
@@ -122,12 +126,37 @@ def _orchestrator_is_running() -> bool:
     return _orchestrator_proc is not None and _orchestrator_proc.poll() is None
 
 
+def _kill_any_orchestrator() -> None:
+    """Kill any python process running orchestrator/main.py, whether or not
+    this dashboard instance spawned it."""
+    global _orchestrator_proc
+    # Kill the dashboard-owned process first
+    if _orchestrator_proc is not None and _orchestrator_proc.poll() is None:
+        _orchestrator_proc.terminate()
+        try:
+            _orchestrator_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            _orchestrator_proc.kill()
+            _orchestrator_proc.wait(timeout=3)
+    _orchestrator_proc = None
+    # Also kill any external orchestrator processes (started from terminal)
+    try:
+        import psutil
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            cmdline = " ".join(proc.info.get("cmdline") or [])
+            if "orchestrator" in cmdline and "main.py" in cmdline:
+                proc.terminate()
+    except Exception:
+        pass
+
+
 def do_reset() -> None:
-    """Restore all on-disk state to pre-iteration-1: clear events.json,
-    restore target-app/app.py from git, delete notes.db, reset session state.
-    """
-    if EVENTS_PATH.exists():
-        EVENTS_PATH.unlink()
+    _kill_any_orchestrator()
+    for p in (EVENTS_PATH, STATIC_EVENTS_PATH):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
     subprocess.run(["git", "checkout", "--", str(TARGET_APP_SOURCE)], check=False)
     if TARGET_APP_DB.exists():
         TARGET_APP_DB.unlink()
@@ -136,14 +165,12 @@ def do_reset() -> None:
     init_state()
 
 
-def do_reset_and_run() -> None:
-    """Reset all state, then launch a fresh orchestrator/main.py run.
+def do_abort() -> None:
+    """Kill the orchestrator process and clear all state — immediate stop."""
+    do_reset()
 
-    The dashboard owns this subprocess (tracked in the module-level
-    _orchestrator_proc) so it can refuse to start a second overlapping run —
-    two orchestrators racing for port 5000 and the same target-app/notes.db
-    would corrupt each other.
-    """
+
+def do_reset_and_run() -> None:
     global _orchestrator_proc
     do_reset()
     _orchestrator_proc = subprocess.Popen(
@@ -153,180 +180,215 @@ def do_reset_and_run() -> None:
 
 
 def render_reset_button() -> None:
-    # Two independent signals a run is in flight: a subprocess this dashboard
-    # itself spawned (_orchestrator_is_running), or an externally-run
-    # orchestrator whose events are still landing mid-iteration (stage not
-    # yet idle/verified) — e.g. someone ran `python orchestrator/main.py` by
-    # hand in a separate terminal instead of clicking this button.
     dashboard_owned_run = _orchestrator_is_running()
     external_run_in_flight = st.session_state.stage not in ("idle", "verified")
-    disabled = dashboard_owned_run or external_run_in_flight
+    stuck = external_run_in_flight and not dashboard_owned_run
 
     if dashboard_owned_run:
-        label, help_text = "Running…", "A run started from this button is still in progress."
-    elif external_run_in_flight:
-        label, help_text = "Reset & Run", "An iteration is in progress — wait for it to finish or stop it first."
-    else:
-        label, help_text = "Reset & Run", "Clears state and starts a fresh 3-iteration run."
+        col1, col2 = st.columns(2)
+        with col1:
+            st.button("Running…", disabled=True, help="A run is in progress.")
+        with col2:
+            if st.button("Abort", type="primary", help="Immediately kill the run and reset."):
+                do_abort()
+                st.rerun()
+        return
 
-    if st.button(label, disabled=disabled, help=help_text):
+    if stuck:
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Reset & Run", help="Clears stuck state and starts a fresh run."):
+                do_reset_and_run()
+                st.rerun()
+        with col2:
+            if st.button("Clear", help="Clears stuck state without starting a new run."):
+                do_reset()
+                st.rerun()
+        return
+
+    if st.button("Reset & Run", help="Clears state and starts a fresh 3-iteration run."):
         do_reset_and_run()
         st.rerun()
 
 
 # ---------------------------------------------------------------------------
-# Event reader
+# Lightweight Python-side event scan
+# Only reads structural events needed to update sidebar / nav state.
+# narration_chunk and stream_chunk are ignored here — the JS iframe handles them.
 # ---------------------------------------------------------------------------
 
-def read_new_events() -> list[dict]:
-    """Read lines appended since the last cursor position."""
+def _scan_new_events() -> None:
+    """Read events.json from Python cursor, update sidebar/llm state only."""
     if not EVENTS_PATH.exists():
-        return []
-    events: list[dict] = []
+        return
+    s = st.session_state
     with EVENTS_PATH.open("rb") as fh:
-        fh.seek(st.session_state.cursor)
-        for raw in fh:
-            raw = raw.strip()
-            if raw:
-                try:
-                    events.append(json.loads(raw))
-                except json.JSONDecodeError:
-                    pass
-        st.session_state.cursor = fh.tell()
-    return events
+        fh.seek(s.cursor)
+        while True:
+            line = fh.readline()
+            if not line:
+                break
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                event = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            t = event.get("type", "")
+            p = event.get("payload", {})
+
+            if t == "sandbox_ready":
+                s.sandbox_url    = p.get("url", "")
+                s.sandbox_id     = p.get("sandbox_id", "")
+                s.sandbox_region = p.get("region", "")
+                s.sandbox_created_at = p.get("created_at", "")
+                s.sandbox_spec   = p.get("spec", {})
+                s.sandbox_status = "running"
+                s.iteration      = event.get("iteration", 0)
+                s.vuln_class     = event.get("vulnerability_class", "")
+                s.sandbox_history.append({
+                    "id":         p.get("sandbox_id", ""),
+                    "url":        p.get("url", ""),
+                    "region":     p.get("region", ""),
+                    "created_at": p.get("created_at", ""),
+                    "status":     "running",
+                    "iteration":  event.get("iteration", 0),
+                    "vuln_class": event.get("vulnerability_class", ""),
+                })
+            elif t == "iteration_start":
+                s.stage      = "scanning"
+                s.iteration  = event.get("iteration", s.iteration)
+                s.vuln_class = event.get("vulnerability_class", "")
+            elif t == "agent_thinking":
+                if p.get("agent") == "defender":
+                    s.stage = "analysing"
+            elif t == "attack_sent":
+                s.stage = "breached"
+            elif t == "patch_applied":
+                s.stage = "patched"
+            elif t == "verified":
+                s.stage = "verified"
+                s.sandbox_status = "verified"
+                if s.sandbox_history:
+                    s.sandbox_history[-1]["status"] = "verified"
+            elif t == "sandbox_destroyed":
+                sbox_id = p.get("sandbox_id", "")
+                for entry in s.sandbox_history:
+                    if entry["id"] == sbox_id:
+                        entry["status"] = "destroyed"
+                        break
+            elif t == "llm_usage":
+                s.llm_calls  += 1
+                s.llm_tokens += p.get("total_tokens", 0)
+
+            s.cursor = fh.tell()
 
 
 # ---------------------------------------------------------------------------
-# Event dispatcher
+# apply_event — full event dispatcher (used by tests and _process_events_this_cycle)
+# The JS iframe owns all feed rendering; Python tracks state so tests can
+# assert on session_state after replaying an event sequence.
 # ---------------------------------------------------------------------------
 
 def apply_event(event: dict) -> bool:
-    """
-    Apply one event to session state.
-    Returns True if it was a narration_chunk (hot path — skip UI redraw delay).
-    """
+    """Apply one event to session state. Returns True for hot-path events
+    (narration_chunk, stream_chunk) that don't need a Streamlit rerun."""
     t = event.get("type", "")
     p = event.get("payload", {})
+    s = st.session_state
 
     if t == "sandbox_ready":
-        st.session_state.sandbox_url    = p.get("url", "")
-        st.session_state.sandbox_id     = p.get("sandbox_id", "")
-        st.session_state.sandbox_region = p.get("region", "")
-        st.session_state.sandbox_created_at = p.get("created_at", "")
-        st.session_state.sandbox_spec   = p.get("spec", {})
-        st.session_state.sandbox_status  = "running"
-        st.session_state.iteration      = event.get("iteration", 0)
-        st.session_state.vuln_class     = event.get("vulnerability_class", "")
-        st.session_state.sandbox_history.append({
+        s.sandbox_url        = p.get("url", "")
+        s.sandbox_id         = p.get("sandbox_id", "")
+        s.sandbox_region     = p.get("region", "")
+        s.sandbox_created_at = p.get("created_at", "")
+        s.sandbox_spec       = p.get("spec", {})
+        s.sandbox_status     = "running"
+        s.iteration          = event.get("iteration", 0)
+        s.vuln_class         = event.get("vulnerability_class", "")
+        s.sandbox_history.append({
             "id":         p.get("sandbox_id", ""),
             "url":        p.get("url", ""),
             "region":     p.get("region", ""),
             "created_at": p.get("created_at", ""),
-            "spec":       p.get("spec", {}),
             "status":     "running",
             "iteration":  event.get("iteration", 0),
             "vuln_class": event.get("vulnerability_class", ""),
         })
-        # reset per-sandbox state
-        st.session_state.diff           = ""
-        st.session_state.wire_request   = None
-        st.session_state.wire_response  = None
-        st.session_state.wire_blocked   = None
-        if not st.session_state.source_code and TARGET_APP_SOURCE.exists():
-            try:
-                st.session_state.source_code = TARGET_APP_SOURCE.read_text(encoding="utf-8")
-            except OSError:
-                st.session_state.source_code = ""
+        s.wire_request = None; s.wire_response = None; s.wire_blocked = None
+        s.diff = ""
 
     elif t == "iteration_start":
-        st.session_state.stage              = "scanning"
-        st.session_state.sandbox_status     = "running"
-        st.session_state.iteration          = event.get("iteration", st.session_state.iteration)
-        st.session_state.vuln_class         = event.get("vulnerability_class", "")
-        st.session_state.attacker_narration = ""
-        st.session_state.attacker_technical = ""
-        st.session_state.defender_narration = ""
-        st.session_state.defender_technical = ""
-        st.session_state.attacker_raw_stream = ""
-        st.session_state.defender_raw_stream = ""
-        st.session_state.diff               = ""
-        st.session_state.wire_request       = None
-        st.session_state.wire_response      = None
-        st.session_state.wire_blocked       = None
-        st.session_state.active_agent       = None
-        st.session_state.active_agent_label = ""
-        st.session_state._iteration_frozen  = False
+        s.stage              = "scanning"
+        s.iteration          = event.get("iteration", s.iteration)
+        s.vuln_class         = event.get("vulnerability_class", "")
+        s.attacker_narration = ""
+        s.attacker_technical = ""
+        s.defender_narration = ""
+        s.defender_technical = ""
+        s.wire_request       = None
+        s.wire_response      = None
+        s.wire_blocked       = None
+        s.diff               = ""
+        s.active_agent       = None
 
     elif t == "agent_thinking":
-        st.session_state.active_agent = p.get("agent")
-        st.session_state.active_agent_label = p.get("label", "")
+        s.active_agent = p.get("agent")
         if p.get("agent") == "defender":
-            st.session_state.stage = "analysing"
+            s.stage = "analysing"
 
     elif t == "narration_chunk":
         agent = p.get("agent")
         char  = p.get("char", "")
         if agent == "attacker":
-            st.session_state.attacker_narration += char
+            s.attacker_narration += char
         elif agent == "defender":
-            st.session_state.defender_narration += char
-        return True  # hot path
+            s.defender_narration += char
+        return True
 
     elif t == "stream_chunk":
-        # Raw SSE text delta from a real (non-mock) model call, shown live
-        # before the assembled JSON response has finished parsing. Cleared
-        # by iteration_start; stops being rendered once the matching
-        # narration is non-empty (see _current_iteration_blocks).
-        agent = p.get("agent")
-        chunk = p.get("chunk", "")
-        if agent == "attacker":
-            st.session_state.attacker_raw_stream += chunk
-        elif agent == "defender":
-            st.session_state.defender_raw_stream += chunk
-        return True  # hot path
+        return True
 
     elif t == "llm_usage":
-        st.session_state.llm_calls  += 1
-        st.session_state.llm_tokens += p.get("total_tokens", 0)
+        s.llm_calls  += 1
+        s.llm_tokens += p.get("total_tokens", 0)
 
     elif t == "attack_sent":
-        st.session_state.stage              = "breached"
-        st.session_state.wire_request       = p.get("request")
-        st.session_state.wire_response      = p.get("response")
-        st.session_state.wire_blocked       = False
-        reasoning = p.get("agent_reasoning", {})
-        st.session_state.attacker_narration = reasoning.get("narration", "")
-        st.session_state.attacker_technical = reasoning.get("technical", "")
-        st.session_state.active_agent       = None
-        st.session_state.active_agent_label = ""
+        s.stage              = "breached"
+        s.wire_request       = p.get("request")
+        s.wire_response      = p.get("response")
+        s.wire_blocked       = False
+        s.active_agent       = None
+        r = p.get("agent_reasoning", {})
+        if not s.attacker_narration:
+            s.attacker_narration = r.get("narration", "")
+        s.attacker_technical = r.get("technical", "")
 
     elif t == "patch_applied":
-        st.session_state.stage              = "patched"
-        st.session_state.diff               = p.get("diff", "")
-        st.session_state.source_code        = p.get("patched_source", "")
-        reasoning = p.get("agent_reasoning", {})
-        st.session_state.defender_narration = reasoning.get("narration", "")
-        st.session_state.defender_technical = reasoning.get("technical", "")
-        st.session_state.active_agent       = None
-        st.session_state.active_agent_label = ""
+        s.stage              = "patched"
+        s.diff               = p.get("diff", "")
+        s.active_agent       = None
+        r = p.get("agent_reasoning", {})
+        if not s.defender_narration:
+            s.defender_narration = r.get("narration", "")
+        s.defender_technical = r.get("technical", "")
 
     elif t == "verified":
-        st.session_state.stage             = "verified"
-        st.session_state.sandbox_status    = "verified"
-        st.session_state.wire_request      = p.get("request")
-        st.session_state.wire_response     = p.get("response")
-        st.session_state.wire_blocked      = p.get("exploit_blocked", False)
-        if st.session_state.sandbox_history:
-            st.session_state.sandbox_history[-1]["status"] = "verified"
+        s.stage         = "verified"
+        s.sandbox_status = "verified"
+        s.wire_request  = p.get("request")
+        s.wire_response = p.get("response")
+        s.wire_blocked  = p.get("exploit_blocked", False)
+        if s.sandbox_history:
+            s.sandbox_history[-1]["status"] = "verified"
 
     elif t == "iteration_complete":
-        st.session_state.active_agent = None
-        st.session_state.history.extend(_current_iteration_blocks())
-        st.session_state._iteration_frozen = True
+        s.active_agent = None
 
     elif t == "sandbox_destroyed":
         sbox_id = p.get("sandbox_id", "")
-        for entry in st.session_state.sandbox_history:
+        for entry in s.sandbox_history:
             if entry["id"] == sbox_id:
                 entry["status"] = "destroyed"
                 break
@@ -335,10 +397,66 @@ def apply_event(event: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# CSS (injected once per session)
+# _process_events_this_cycle — used by the Python poll loop to drain events
 # ---------------------------------------------------------------------------
 
-_CSS = """
+MAX_EVENTS_PER_CYCLE        = 50
+MAX_NARRATION_CHARS_PER_CYCLE = 6
+NARRATION_CHAR_DELAY_S      = 0.033
+MAX_STREAM_CHARS_PER_CYCLE  = 15
+STREAM_CHAR_DELAY_S         = 0.01
+
+
+def _process_events_this_cycle(
+    tagged: list[tuple[dict, int]],
+) -> tuple[int | None, bool, bool]:
+    """Apply events from the queue up to per-cycle caps.
+
+    Returns (last_consumed_offset, had_structural_event, has_more).
+    The JS iframe handles rendering; Python processes events only to keep
+    sidebar/nav state in sync and to give tests an apply_event path.
+    """
+    narration_chars = 0
+    stream_chars    = 0
+    processed       = 0
+    had_structural  = False
+    last_offset: int | None = None
+
+    for event, end_offset in tagged:
+        t = event.get("type")
+        if t == "narration_chunk":
+            if narration_chars >= MAX_NARRATION_CHARS_PER_CYCLE:
+                return last_offset, had_structural, True
+            apply_event(event)
+            narration_chars += 1
+            processed       += 1
+            last_offset      = end_offset
+            time.sleep(NARRATION_CHAR_DELAY_S)
+        elif t == "stream_chunk":
+            if stream_chars >= MAX_STREAM_CHARS_PER_CYCLE:
+                return last_offset, had_structural, True
+            apply_event(event)
+            stream_chars += len(event.get("payload", {}).get("chunk", ""))
+            processed    += 1
+            last_offset   = end_offset
+            time.sleep(STREAM_CHAR_DELAY_S)
+        else:
+            if processed >= MAX_EVENTS_PER_CYCLE:
+                return last_offset, had_structural, True
+            apply_event(event)
+            processed   += 1
+            last_offset  = end_offset
+            had_structural = True
+
+    return last_offset, had_structural, False
+
+
+# ---------------------------------------------------------------------------
+# CSS — injected once into the Streamlit shell (no feed classes needed here;
+# those live inside the iframe)
+# ---------------------------------------------------------------------------
+
+_SHELL_CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600&family=Lora:wght@400;600&display=swap');
 
@@ -352,19 +470,9 @@ _CSS = """
     --danger: #e53935;
     --safe: #43a047;
     --feed-bg: #1e1e2e;
-    --feed-text: rgba(248,244,244,0.92);
     --feed-muted: rgba(248,244,244,0.55);
-    --feed-divider: rgba(248,244,244,0.16);
 }
 
-@keyframes livePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
-@keyframes caretBlink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
-@keyframes feedIn { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
-
-/* Force the light parchment shell regardless of the browser/OS dark-mode
-   preference Streamlit otherwise follows — only the feed panel below is
-   meant to read as dark. Belt-and-braces alongside .streamlit/config.toml,
-   which is the primary fix (this CSS covers any client that ignores it). */
 html, body,
 [data-testid="stApp"],
 [data-testid="stAppViewContainer"],
@@ -374,9 +482,7 @@ html, body,
     background-color: var(--color-bg) !important;
     color: var(--color-text) !important;
 }
-[data-testid="stApp"] * {
-    color: inherit;
-}
+[data-testid="stApp"] * { color: inherit; }
 body { font-family: var(--font-body); }
 [data-testid="stHeader"] { background-color: transparent !important; }
 [data-testid="baseButton-secondary"] {
@@ -390,7 +496,6 @@ body { font-family: var(--font-body); }
     color: var(--color-accent) !important;
 }
 
-/* — nav — */
 .aos-brand { font-family: var(--font-heading); font-weight: 600; font-size: 18px; color: var(--color-text); }
 .aos-tagline { font-size: 11px; color: rgba(32,31,29,0.55); letter-spacing: 0.02em; }
 .aos-tag {
@@ -398,18 +503,9 @@ body { font-family: var(--font-body); }
     padding: 3px 10px; border-radius: 3px;
     border: 1px solid var(--color-accent); color: var(--color-accent);
 }
-.aos-url {
-    font-size: 11px; color: rgba(32,31,29,0.55); letter-spacing: 0.02em;
-    text-align: right; margin-top: 4px;
-}
 
-/* — sidebar (sandbox roster) — */
-[data-testid="stSidebar"] {
-    background: var(--feed-bg) !important;
-}
-[data-testid="stSidebar"] * {
-    color: var(--feed-text) !important;
-}
+[data-testid="stSidebar"] { background: var(--feed-bg) !important; }
+[data-testid="stSidebar"] * { color: rgba(248,244,244,0.92) !important; }
 .aos-sidebar-title {
     font-family: var(--font-heading); font-weight: 600; font-size: 15px;
     letter-spacing: 0.02em; margin-bottom: 2px;
@@ -421,53 +517,37 @@ body { font-family: var(--font-body); }
 .aos-sbox-card {
     display: flex; flex-direction: column; gap: 6px;
     padding: 10px 12px; margin-bottom: 10px;
-    border: 1px solid var(--feed-divider); border-radius: 6px;
+    border: 1px solid rgba(248,244,244,0.16); border-radius: 6px;
     background: rgba(255,255,255,0.03);
 }
-.aos-sbox-card.running { border-color: var(--color-accent); }
+.aos-sbox-card.running  { border-color: var(--color-accent); }
 .aos-sbox-card.verified { border-color: var(--safe); }
 .aos-sbox-card.destroyed { opacity: 0.55; }
 .aos-sbox-tags { display: flex; gap: 6px; flex-wrap: wrap; }
 .aos-sbox-tag {
-    font-size: 10px; letter-spacing: 0.03em;
-    padding: 2px 8px; border-radius: 3px;
+    font-size: 10px; letter-spacing: 0.03em; padding: 2px 8px; border-radius: 3px;
     border: 1px solid var(--color-accent); color: var(--color-accent);
 }
-.aos-sbox-url {
-    font-family: ui-monospace, Menlo, monospace; font-size: 10.5px;
-    color: var(--feed-muted); word-break: break-all;
-}
-.aos-sbox-status {
-    display: inline-flex; align-items: center; gap: 5px;
-    font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
-}
+.aos-sbox-url { font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; color: var(--feed-muted); word-break: break-all; }
+.aos-sbox-status { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
 .aos-sbox-status-dot { width: 6px; height: 6px; border-radius: 50%; }
-.aos-sbox-status.running .aos-sbox-status-dot { background: var(--color-accent); animation: livePulse 1.1s ease-in-out infinite; }
+@keyframes livePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+.aos-sbox-status.running  .aos-sbox-status-dot { background: var(--color-accent); animation: livePulse 1.1s ease-in-out infinite; }
 .aos-sbox-status.verified .aos-sbox-status-dot { background: var(--safe); }
 .aos-sbox-status.destroyed .aos-sbox-status-dot { background: var(--feed-muted); }
-.aos-sbox-status.running { color: var(--color-accent); }
+.aos-sbox-status.running  { color: var(--color-accent); }
 .aos-sbox-status.verified { color: var(--safe); }
 .aos-sbox-status.destroyed { color: var(--feed-muted); }
-.aos-sbox-meta {
-    font-family: ui-monospace, Menlo, monospace; font-size: 10.5px;
-    color: var(--feed-muted);
-}
-.aos-sidebar-empty {
-    font-family: var(--font-body); font-style: italic; font-size: 12px;
-    color: var(--feed-muted);
-}
+.aos-sbox-meta { font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; color: var(--feed-muted); }
+.aos-sidebar-empty { font-family: var(--font-body); font-style: italic; font-size: 12px; color: var(--feed-muted); }
 
-/* — round gallery — */
 .aos-round-card {
     display: flex; align-items: center; gap: 12px;
     padding: 10px 16px; border-radius: 4px;
     border: 1px solid var(--color-divider);
 }
 .aos-round-card.active { border-color: var(--color-accent); box-shadow: 0 1px 2px rgba(45,43,43,0.14); }
-.aos-round-numeral {
-    font-family: var(--font-heading); font-weight: 600; font-size: 26px;
-    width: 30px; flex: none; color: rgba(32,31,29,0.45);
-}
+.aos-round-numeral { font-family: var(--font-heading); font-weight: 600; font-size: 26px; width: 30px; flex: none; color: rgba(32,31,29,0.45); }
 .aos-round-card.active .aos-round-numeral { color: var(--color-accent); }
 .aos-round-title { font-family: var(--font-heading); font-weight: 600; font-size: 15px; color: var(--color-text); }
 .aos-round-stage {
@@ -475,127 +555,25 @@ body { font-family: var(--font-body); }
     padding: 3px 9px; border-radius: 3px; border: 1px solid currentColor;
     flex: none; white-space: nowrap;
 }
-
-/* — feed panel — */
-.aos-feed {
-    background: var(--feed-bg); border-radius: 7px;
-    padding: 24px; display: flex; flex-direction: column; gap: 18px;
-}
-.aos-feed-empty { color: var(--feed-muted); font-family: var(--font-body); font-style: italic; }
-
-.aos-divider { display: flex; align-items: center; gap: 14px; margin: 6px 0; animation: feedIn .5s ease both; }
-.aos-divider-line { flex: 1; height: 1px; background: var(--feed-divider); }
-.aos-divider-label {
-    font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
-    white-space: nowrap; font-family: var(--font-heading); font-weight: 600;
-}
-
-.aos-narration { display: flex; flex-direction: column; gap: 8px; animation: feedIn .5s ease both; }
-.aos-role-tag {
-    font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 600;
-    border-radius: 3px; padding: 2px 8px; width: fit-content; border: 1px solid currentColor;
-}
-.aos-role-tag.attacker { color: var(--danger); }
-.aos-role-tag.defender { color: var(--safe); }
-.aos-quote {
-    font-family: var(--font-heading); font-style: italic; font-weight: 600;
-    font-size: 24px; line-height: 1.4; color: var(--feed-text);
-}
-.aos-caret { animation: caretBlink 0.9s step-end infinite; color: var(--color-accent); }
-.aos-technical {
-    font-family: ui-monospace, Menlo, monospace; font-size: 11.5px;
-    line-height: 1.6; color: var(--feed-muted); white-space: pre-wrap;
-}
-
-.aos-taunt {
-    display: flex; flex-direction: column; gap: 6px;
-    padding-left: 18px; border-left: 2px dashed var(--danger);
-    animation: feedIn .5s ease both;
-}
-.aos-taunt-tag { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--danger); width: fit-content; }
-.aos-taunt-text { font-family: ui-monospace, Menlo, monospace; font-size: 13px; font-style: italic; color: var(--feed-muted); }
-
-.aos-wire {
-    display: flex; flex-direction: column; gap: 8px;
-    padding-left: 14px; animation: feedIn .5s ease both;
-}
-.aos-wire.blocked { border-left: 3px solid var(--safe); }
-.aos-wire.breach { border-left: 3px solid var(--danger); }
-.aos-wire-header { display: flex; align-items: center; gap: 8px; }
-.aos-wire-dot { width: 7px; height: 7px; border-radius: 50%; }
-.aos-wire.blocked .aos-wire-dot { background: var(--safe); }
-.aos-wire.breach .aos-wire-dot { background: var(--danger); }
-.aos-wire-label { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 600; }
-.aos-wire.blocked .aos-wire-label { color: var(--safe); }
-.aos-wire.breach .aos-wire-label { color: var(--danger); }
-.aos-wire-block {
-    font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; line-height: 1.6;
-    white-space: pre-wrap; word-break: break-all; color: var(--feed-text);
-    background: rgba(255,255,255,0.04); border: 1px solid var(--feed-divider);
-    border-radius: 4px; padding: 10px 12px;
-}
-.aos-wire-curl { color: var(--color-accent); border-color: var(--color-accent); }
-
-.aos-live-timer {
-    display: flex; align-items: center; gap: 8px;
-    font-family: ui-monospace, Menlo, monospace; font-size: 12px;
-    color: var(--color-accent); animation: feedIn .5s ease both;
-}
-.aos-live-timer-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--color-accent); animation: livePulse 1.1s ease-in-out infinite; }
-
-.aos-diff {
-    display: flex; flex-direction: column; gap: 4px;
-    font-family: ui-monospace, Menlo, monospace; font-size: 12px; line-height: 1.7;
-    background: rgba(255,255,255,0.04); border: 1px solid var(--feed-divider);
-    border-radius: 4px; padding: 12px 14px; animation: feedIn .5s ease both;
-}
-.aos-diff-kicker {
-    font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase;
-    color: var(--color-accent); margin-bottom: 4px;
-}
-.aos-diff-line { padding-left: 8px; white-space: pre-wrap; word-break: break-all; }
-.aos-diff-line.add { color: var(--safe); border-left: 2px solid var(--safe); }
-.aos-diff-line.del { color: var(--danger); border-left: 2px solid var(--danger); }
-.aos-diff-line.ctx { color: var(--feed-text); border-left: 2px solid transparent; }
-
-.aos-live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--color-accent); animation: livePulse 1.1s ease-in-out infinite; }
 </style>
 """
 
-
-def inject_css() -> None:
-    st.html(_CSS)
-
-
-# ---------------------------------------------------------------------------
-# Render helpers
-# ---------------------------------------------------------------------------
-
 MODEL_TAG = "ai& · deepseek-v4-flash"
-
-# Fixed round order for the gallery strip — mirrors orchestrator/main.py's
-# ITERATIONS list (sqli, idor, missing_auth), independent of which iteration
-# has actually run yet so all three rounds are always visible.
 ROUND_NUMERALS = {1: "I", 2: "II", 3: "III"}
 
 
-def render_nav_bar() -> None:
-    col_brand, col_tags, col_action = st.columns([3, 2.4, 0.8])
-    with col_brand:
-        st.html(
-            '<div class="aos-brand">Attack on Sandbox</div>'
-            '<div class="aos-tagline">Two agents. One sandbox. No trust.</div>'
-        )
-    with col_tags:
-        st.html(
-            f'<div style="text-align:right; padding-top: 6px">'
-            f'<span class="aos-tag">Daytona sandbox</span>&nbsp;'
-            f'<span class="aos-tag">{MODEL_TAG}</span>'
-            f'</div>'
-        )
-    with col_action:
-        st.html('<div style="height: 18px"></div>')
-        render_reset_button()
+def inject_shell_css() -> None:
+    if not st.session_state.get("_css_injected"):
+        st.html(_SHELL_CSS)
+        st.session_state["_css_injected"] = True
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+
+def _escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _sbox_card_html(entry: dict) -> str:
@@ -612,43 +590,80 @@ def _sbox_card_html(entry: dict) -> str:
     meta_line = f'<div class="aos-sbox-meta">{_escape(" · ".join(meta_bits))}</div>' if meta_bits else ""
     return (
         f'<div class="aos-sbox-card {status}">'
-        f'<div class="aos-sbox-tags">'
-        f'<span class="aos-sbox-tag">{_escape(sbox_id) or "sandbox"}</span>'
-        f'</div>'
+        f'<div class="aos-sbox-tags"><span class="aos-sbox-tag">{_escape(sbox_id) or "sandbox"}</span></div>'
         f'<div class="aos-sbox-url">{_escape(url) or "—"}</div>'
         f'{meta_line}'
-        f'<div class="aos-sbox-status {status}">'
-        f'<span class="aos-sbox-status-dot"></span>{status}'
-        f'</div>'
+        f'<div class="aos-sbox-status {status}"><span class="aos-sbox-status-dot"></span>{status}</div>'
         f'</div>'
     )
 
 
+_SIDEBAR_CSS = """
+<style>
+.aos-sidebar-title {
+    font-family: 'Cormorant Garamond', Georgia, serif; font-weight: 600; font-size: 15px;
+    letter-spacing: 0.02em; margin-bottom: 2px; color: rgba(248,244,244,0.92);
+}
+.aos-sidebar-usage {
+    font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+    color: rgba(248,244,244,0.55); margin-bottom: 4px;
+}
+.aos-sbox-card {
+    display: flex; flex-direction: column; gap: 6px;
+    padding: 10px 12px; margin-bottom: 10px;
+    border: 1px solid rgba(248,244,244,0.16); border-radius: 6px;
+    background: rgba(255,255,255,0.03);
+}
+.aos-sbox-card.running  { border-color: #b68235; }
+.aos-sbox-card.verified { border-color: #43a047; }
+.aos-sbox-card.destroyed { opacity: 0.55; }
+.aos-sbox-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+.aos-sbox-tag {
+    font-size: 10px; letter-spacing: 0.03em; padding: 2px 8px; border-radius: 3px;
+    border: 1px solid #b68235; color: #b68235;
+}
+.aos-sbox-url { font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; color: rgba(248,244,244,0.55); word-break: break-all; }
+.aos-sbox-status { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
+.aos-sbox-status-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
+@keyframes livePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+.aos-sbox-status.running  .aos-sbox-status-dot { background: #b68235; animation: livePulse 1.1s ease-in-out infinite; }
+.aos-sbox-status.verified .aos-sbox-status-dot { background: #43a047; }
+.aos-sbox-status.destroyed .aos-sbox-status-dot { background: rgba(248,244,244,0.55); }
+.aos-sbox-status.running  { color: #b68235; }
+.aos-sbox-status.verified { color: #43a047; }
+.aos-sbox-status.destroyed { color: rgba(248,244,244,0.55); }
+.aos-sbox-meta { font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; color: rgba(248,244,244,0.55); }
+.aos-sidebar-empty { font-style: italic; font-size: 12px; color: rgba(248,244,244,0.55); }
+</style>
+"""
+
+
 def render_sidebar() -> None:
-    """Sticky sidebar listing every Daytona sandbox this run has created —
-    not just the currently-live one — plus overall ai& call/token usage.
-    Uses Streamlit's native sidebar so it stays pinned while the feed scrolls.
-    """
+    s = st.session_state
+    history = s.sandbox_history
+    key = f"{len(history)}:{[e.get('status') for e in history]}:{s.llm_calls}:{s.llm_tokens}"
     with st.sidebar:
-        st.html('<div class="aos-sidebar-title">Daytona sandboxes</div>')
-        calls, tokens = st.session_state.llm_calls, st.session_state.llm_tokens
-        if calls:
-            st.html(f'<div class="aos-sidebar-usage">{MODEL_TAG} · {calls} calls · {tokens:,} tokens</div>')
-
-        history = st.session_state.sandbox_history
-        if not history:
-            st.html('<div class="aos-sidebar-empty">Waiting for the first sandbox…</div>')
+        if s._sidebar_cache_key == key:
+            st.html(s._sidebar_html_cache)
             return
+        s._sidebar_cache_key = key
+        parts = [_SIDEBAR_CSS, '<div class="aos-sidebar-title">Daytona sandboxes</div>']
+        if s.llm_calls:
+            parts.append(f'<div class="aos-sidebar-usage">{MODEL_TAG} · {s.llm_calls} calls · {s.llm_tokens:,} tokens</div>')
+        if not history:
+            parts.append('<div class="aos-sidebar-empty">Waiting for the first sandbox…</div>')
+        else:
+            for entry in reversed(history):
+                parts.append(_sbox_card_html(entry))
+        s._sidebar_html_cache = "".join(parts)
+        st.html(s._sidebar_html_cache)
 
-        # Most recent first so the live sandbox is always at the top.
-        for entry in reversed(history):
-            st.html(_sbox_card_html(entry))
 
+# ---------------------------------------------------------------------------
+# Nav bar + round gallery (combined into one st.html block)
+# ---------------------------------------------------------------------------
 
 def _round_stage_label(round_num: int) -> str:
-    """Vulnerable / Scanning / Breached / Analysing / Patched / Verified for a
-    gallery card, derived from current session state — Pending if that
-    round's iteration hasn't started yet, Verified if a later round has."""
     s = st.session_state
     if s.iteration > round_num:
         return "verified"
@@ -657,384 +672,688 @@ def _round_stage_label(round_num: int) -> str:
     return s.stage
 
 
-def render_round_gallery() -> None:
-    cols = st.columns(3)
-    for round_num, col in zip((1, 2, 3), cols):
-        stage = _round_stage_label(round_num)
-        active = st.session_state.iteration == round_num
+_NAV_CSS = """<style>
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600&family=Lora:wght@400;600&display=swap');
+.aos-brand { font-family: 'Cormorant Garamond', Georgia, serif; font-weight: 600; font-size: 18px; color: #201f1d; }
+.aos-tagline { font-size: 11px; color: rgba(32,31,29,0.55); letter-spacing: 0.02em; }
+.aos-tag {
+    display: inline-flex; align-items: center; font-size: 11px;
+    padding: 3px 10px; border-radius: 3px;
+    border: 1px solid #b68235; color: #b68235;
+}
+.aos-round-card {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 16px; border-radius: 4px;
+    border: 1px solid rgba(32,31,29,0.16);
+}
+.aos-round-numeral { font-family: 'Cormorant Garamond', Georgia, serif; font-weight: 600; font-size: 26px; width: 30px; flex: none; color: rgba(32,31,29,0.45); }
+.aos-round-numeral.active { color: #b68235; }
+.aos-round-title { font-family: 'Cormorant Garamond', Georgia, serif; font-weight: 600; font-size: 15px; color: #201f1d; }
+.aos-round-stage {
+    font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 3px 9px; border-radius: 3px; border: 1px solid currentColor;
+    flex: none; white-space: nowrap;
+}
+</style>"""
+
+
+def _build_header_html(s) -> str:
+    token_line = (
+        f'<span style="font-size:11px;color:rgba(32,31,29,0.55);margin-left:8px">'
+        f'{s.llm_calls} calls · {s.llm_tokens:,} tokens</span>'
+    ) if s.llm_calls else ""
+
+    cards = ""
+    for n in (1, 2, 3):
+        stage = _round_stage_label(n)
+        active = s.iteration == n
         color = STAGE_COLORS.get(stage, "#9b9797")
-        with col:
-            st.html(
-                f'<div class="aos-round-card{" active" if active else ""}">'
-                f'<div class="aos-round-numeral">{ROUND_NUMERALS[round_num]}</div>'
-                f'<div style="flex:1;min-width:0">'
-                f'<div class="aos-round-title">Iteration {ROUND_NUMERALS[round_num]}</div>'
-                f'</div>'
-                f'<div class="aos-round-stage" style="color:{color}">{stage.upper()}</div>'
-                f'</div>'
-            )
-
-
-def _format_request(req: dict) -> str:
-    if not req:
-        return ""
-    method = req.get("method", "")
-    url    = req.get("url", "")
-    hdrs   = req.get("headers") or {}
-    body   = req.get("body")
-    lines  = [f"{method} {url}"]
-    for k, v in hdrs.items():
-        lines.append(f"{k}: {v}")
-    if body is not None:
-        lines.append("")
-        lines.append(json.dumps(body, indent=2) if isinstance(body, dict) else str(body))
-    return "\n".join(lines)
-
-
-def _format_curl(req: dict) -> str:
-    """Render {method, url, headers, body} as a copy-pasteable curl command —
-    a live audience can read it as a real terminal command they could run
-    themselves against the visible sandbox URL, not a canned animation."""
-    if not req:
-        return ""
-    method = req.get("method", "GET").upper()
-    url    = req.get("url", "")
-    hdrs   = req.get("headers") or {}
-    body   = req.get("body")
-
-    parts = [f"curl -X {method} '{url}'"]
-    for k, v in hdrs.items():
-        parts.append(f"  -H '{k}: {v}'")
-    if body is not None:
-        body_s = json.dumps(body) if isinstance(body, dict) else str(body)
-        escaped_body = body_s.replace("'", "'\\''")
-        parts.append(f"  -d '{escaped_body}'")
-    return " \\\n".join(parts)
-
-
-def _format_response(resp: dict) -> str:
-    if not resp:
-        return ""
-    status = resp.get("status", "")
-    body   = resp.get("body", "")
-    body_s = json.dumps(body, indent=2) if isinstance(body, dict) else str(body)
-    return f"HTTP {status}\n\n{body_s}"
-
-
-def _escape(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def _taunt_for(vuln_class: str) -> str:
-    """Look up the pre-scripted attacker taunt for a vulnerability class.
-
-    Returns "" for an unrecognised class rather than raising, so a caller can
-    treat a missing taunt the same as "no taunt to show yet".
-    """
-    return TAUNTS.get(vuln_class, "")
-
-
-def _feed_live_timer_block(agent: str, label: str, timer_id: str) -> str:
-    """HTML+JS for a real wall-clock timer ticking while a request is in
-    flight — proves this is genuinely live, since a canned animation has no
-    reason to render a clock that actually counts real elapsed time.
-
-    Client-side JS (setInterval from performance.now() at render time)
-    rather than a server-computed elapsed value: it ticks smoothly in real
-    browser time between Streamlit reruns, not just once per ~80ms poll.
-    Re-initialises harmlessly on every rerun while this block keeps
-    rendering — visually indistinguishable from one continuously running
-    clock, and stops being rendered (frozen at its last value) the instant
-    the caller swaps in the real response block.
-    """
-    role_label = "Attacker" if agent == "attacker" else "Defender"
+        active_border = f"border-color:{color};" if active else ""
+        numeral_color = color if active else "rgba(32,31,29,0.45)"
+        cards += (
+            f'<div class="aos-round-card" style="flex:1;{active_border}">'
+            f'<div class="aos-round-numeral" style="color:{numeral_color}">{ROUND_NUMERALS[n]}</div>'
+            f'<div style="flex:1;min-width:0"><div class="aos-round-title">Iteration {ROUND_NUMERALS[n]}</div></div>'
+            f'<div class="aos-round-stage" style="color:{color}">{stage.upper()}</div>'
+            f'</div>'
+        )
     return (
-        f'<div class="aos-live-timer">'
-        f'<div class="aos-live-timer-dot"></div>'
-        f'<span class="aos-role-tag {agent}">{role_label}</span>'
-        f'<span>{_escape(label)}</span>'
-        f'<span id="{timer_id}">0.00s</span>'
-        f'<script>'
-        f'(function(){{'
-        f'  var start = performance.now();'
-        f'  var el = document.getElementById("{timer_id}");'
-        f'  var tick = function(){{'
-        f'    if (!el || !document.body.contains(el)) return;'
-        f'    el.textContent = ((performance.now() - start) / 1000).toFixed(2) + "s";'
-        f'    setTimeout(tick, 100);'
-        f'  }};'
-        f'  tick();'
-        f'}})();'
-        f'</script>'
+        f'{_NAV_CSS}'
+        f'<div style="display:flex;align-items:flex-start;justify-content:space-between;padding-bottom:4px">'
+        f'<div><div class="aos-brand">Attack on Sandbox</div>'
+        f'<div class="aos-tagline">Two agents. One sandbox. No trust.</div></div>'
+        f'<div style="text-align:right;padding-top:6px">'
+        f'<span class="aos-tag">Daytona sandbox</span>&nbsp;'
+        f'<span class="aos-tag">{MODEL_TAG}</span>{token_line}</div>'
         f'</div>'
+        f'<div style="display:flex;gap:12px;margin:8px 0 4px">{cards}</div>'
     )
 
 
-def _feed_narration_block(agent: str, narration: str, technical: str, complete: bool) -> str:
-    """HTML for one narration card: role pill, italic serif quote, optional
-    trailing caret while incomplete, technical detail once complete."""
-    role_label = "Attacker" if agent == "attacker" else "Defender"
-    quote = _escape(narration)
-    caret = '<span class="aos-caret">▌</span>' if not complete else ""
-    technical_html = f'<div class="aos-technical">{_escape(technical)}</div>' if complete and technical else ""
-    return (
-        f'<div class="aos-narration">'
-        f'<span class="aos-role-tag {agent}">{role_label}</span>'
-        f'<div class="aos-quote">“{quote}”{caret}</div>'
-        f'{technical_html}'
-        f'</div>'
-    )
-
-
-def _feed_raw_stream_block(agent: str, raw_text: str) -> str:
-    """HTML for the raw JSON-in-progress text streaming in live from a real
-    (non-mock) model call, shown before the clean narration card is ready —
-    proves this is a genuine live token stream, not a canned animation."""
-    role_label = "Attacker" if agent == "attacker" else "Defender"
-    return (
-        f'<div class="aos-narration">'
-        f'<span class="aos-role-tag {agent}">{role_label}</span>'
-        f'<div class="aos-technical">{_escape(raw_text)}'
-        f'<span class="aos-caret">▌</span></div>'
-        f'</div>'
-    )
-
-
-def _feed_taunt_block(taunt_text: str) -> str:
-    """HTML for the dashed-border attacker taunt line between breach and patch."""
-    return (
-        f'<div class="aos-taunt">'
-        f'<span class="aos-taunt-tag">Attacker → Defender</span>'
-        f'<div class="aos-taunt-text">{_escape(taunt_text)}</div>'
-        f'</div>'
-    )
-
-
-def _feed_wire_block(request: dict, response: dict, blocked: bool | None) -> str:
-    """HTML for one wire request/response pair, colored by outcome.
-
-    Leads with the curl-equivalent command — a live audience can read it as
-    a real terminal command they could copy and run themselves against the
-    visible sandbox URL, which a canned animation would have no reason to
-    render in copyable form.
-    """
-    css_class = "blocked" if blocked else "breach"
-    label = "Exploit blocked — patch holds" if blocked else "Breach confirmed"
-    curl_text = _escape(_format_curl(request))
-    req_text = _escape(_format_request(request))
-    resp_text = _escape(_format_response(response))
-    return (
-        f'<div class="aos-wire {css_class}">'
-        f'<div class="aos-wire-header"><div class="aos-wire-dot"></div>'
-        f'<span class="aos-wire-label">{label}</span></div>'
-        f'<div class="aos-wire-block aos-wire-curl">$ {curl_text}</div>'
-        f'<div class="aos-wire-block">{req_text}</div>'
-        f'<div class="aos-wire-block">{resp_text}</div>'
-        f'</div>'
-    )
-
-
-def _feed_divider(text: str, color: str) -> str:
-    return (
-        f'<div class="aos-divider">'
-        f'<div class="aos-divider-line"></div>'
-        f'<div class="aos-divider-label" style="color:{color}">{_escape(text)}</div>'
-        f'<div class="aos-divider-line"></div>'
-        f'</div>'
-    )
-
-
-def _diff_line_class(line: str) -> str:
-    """Classify one unified-diff line for coloring: add/del/ctx.
-
-    Skips the +++/--- file headers and @@ hunk markers entirely (they're
-    metadata, not code) by returning "" — callers drop those lines.
-    """
-    if line.startswith(("+++", "---", "@@")):
-        return ""
-    if line.startswith("+"):
-        return "add"
-    if line.startswith("-"):
-        return "del"
-    return "ctx"
-
-
-def _feed_diff_block(endpoint: str, diff: str) -> str:
-    """HTML for a unified diff, one colored/bordered line per row, matching
-    the prototype's line-by-line diff rendering (feedIn stagger, no per-char
-    typewriter — that's cosmetic-only in the prototype and not reproduced)."""
-    rows = []
-    for raw_line in diff.splitlines():
-        css_class = _diff_line_class(raw_line)
-        if not css_class:
-            continue
-        rows.append(f'<div class="aos-diff-line {css_class}">{_escape(raw_line)}</div>')
-    return (
-        f'<div class="aos-diff">'
-        f'<div class="aos-diff-kicker">{_escape(endpoint)} — patch applied</div>'
-        f'{"".join(rows)}'
-        f'</div>'
-    )
-
-
-def _current_iteration_blocks() -> list[str]:
-    """Blocks for the iteration currently in progress, built from the live
-    session-state fields that iteration_start clears at the top of each new
-    iteration: divider -> attacker narration -> wire (breach) -> taunt ->
-    defender narration -> diff -> wire (verified).
-
-    Renders whatever is known so far; sections that haven't happened yet
-    simply aren't emitted. Returns nothing once iteration_complete has
-    already frozen these same blocks into history (_iteration_frozen) —
-    otherwise the last iteration of a run, which never gets superseded by
-    a following iteration_start, would render twice.
-    """
+def render_nav_and_gallery() -> None:
     s = st.session_state
-    blocks: list[str] = []
-
-    if not s.iteration or s._iteration_frozen:
-        return blocks
-
-    vc_label = VULN_LABELS.get(s.vuln_class, s.vuln_class)
-    if s.stage == "verified":
-        color = "var(--safe)" if s.wire_blocked else "var(--danger)"
-        divider_text = f"Iteration {s.iteration} complete — {vc_label}"
-    else:
-        color = "var(--color-accent)"
-        divider_text = f"Iteration {s.iteration} — {vc_label}"
-    blocks.append(_feed_divider(divider_text, color))
-
-    attacker_active = s.active_agent == "attacker"
-    attacker_streaming_raw = attacker_active and s.attacker_raw_stream and not s.attacker_narration
-    attacker_waiting = attacker_active and not s.attacker_raw_stream and not s.attacker_narration
-    if attacker_waiting:
-        blocks.append(_feed_live_timer_block(
-            "attacker", "requesting deepseek-v4-flash…", f"aos-timer-attacker-{s.iteration}"
-        ))
-    elif attacker_streaming_raw:
-        blocks.append(_feed_raw_stream_block("attacker", s.attacker_raw_stream))
-    elif s.attacker_narration or attacker_active:
-        blocks.append(_feed_narration_block(
-            "attacker", s.attacker_narration, s.attacker_technical,
-            complete=not attacker_active or bool(s.wire_request),
-        ))
-
-    if s.wire_request is not None and s.stage in ("breached", "analysing", "patched", "verified"):
-        blocked = False if s.stage != "verified" else s.wire_blocked
-        blocks.append(_feed_wire_block(s.wire_request, s.wire_response, blocked))
-
-        taunt = _taunt_for(s.vuln_class)
-        if taunt and s.stage in ("analysing", "patched", "verified"):
-            blocks.append(_feed_taunt_block(taunt))
-
-    defender_active = s.active_agent == "defender"
-    defender_streaming_raw = defender_active and s.defender_raw_stream and not s.defender_narration
-    defender_waiting = defender_active and not s.defender_raw_stream and not s.defender_narration
-    if defender_waiting:
-        blocks.append(_feed_live_timer_block(
-            "defender", "requesting deepseek-v4-flash…", f"aos-timer-defender-{s.iteration}"
-        ))
-    elif defender_streaming_raw:
-        blocks.append(_feed_raw_stream_block("defender", s.defender_raw_stream))
-    elif s.defender_narration or defender_active:
-        blocks.append(_feed_narration_block(
-            "defender", s.defender_narration, s.defender_technical,
-            complete=not defender_active or bool(s.diff),
-        ))
-
-    if s.diff and s.stage in ("patched", "verified"):
-        endpoint = s.wire_request.get("url", "") if s.wire_request else ""
-        blocks.append(_feed_diff_block(endpoint, s.diff))
-
-    if s.stage == "verified" and s.wire_request is not None:
-        blocks.append(_feed_wire_block(s.wire_request, s.wire_response, s.wire_blocked))
-
-    return blocks
-
-
-def render_feed() -> None:
-    """Running feed of every iteration this demo run has produced so far:
-    each completed iteration's full narration/wire/taunt/diff blocks (frozen
-    in st.session_state.history at iteration_complete, before the next
-    iteration_start wipes the live fields), followed by whatever is known
-    so far for the iteration currently in progress. Nothing is removed
-    until a reset.
-    """
-    blocks = list(st.session_state.history) + _current_iteration_blocks()
-
-    if not blocks:
-        st.html('<div class="aos-feed"><div class="aos-feed-empty">Waiting for the first iteration…</div></div>')
-        return
-
-    # unsafe_allow_javascript: st.html strips <script> tags by default
-    # (DOMPurify), which silently no-ops _feed_live_timer_block's clock and
-    # the auto-scroll script below. Safe here — every value interpolated
-    # into these blocks passes through _escape() first, so no untrusted
-    # input ever reaches this HTML.
-    #
-    # Auto-scroll: a marker div after the last block, scrolled into view on
-    # every render. scrollIntoView on an element already in view is a
-    # harmless no-op, so this is safe to re-run every ~80ms poll cycle
-    # without fighting a user who has manually scrolled up to read history —
-    # it only moves the viewport when new content actually pushed the
-    # marker out of view.
-    st.html(
-        f'<div class="aos-feed">{"".join(blocks)}'
-        f'<div id="aos-feed-end"></div>'
-        f'<script>'
-        f'document.getElementById("aos-feed-end")'
-        f'?.scrollIntoView({{behavior: "auto", block: "end"}});'
-        f'</script>'
-        f'</div>',
-        unsafe_allow_javascript=True,
+    key = (
+        f"{s.llm_calls}:{s.llm_tokens}:{s.iteration}:{s.stage}:"
+        + ":".join(_round_stage_label(n) for n in (1, 2, 3))
     )
+    if s._nav_cache_key != key:
+        s._nav_cache_key = key
+        s._nav_html_cache = _build_header_html(s)
+
+    running = _orchestrator_is_running()
+    col_header, col_action = st.columns([5.5, 1.6 if running else 0.8])
+    with col_header:
+        st.html(s._nav_html_cache)
+    with col_action:
+        st.html('<div style="height:18px"></div>')
+        render_reset_button()
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Feed iframe — self-contained HTML+JS that owns all live rendering
 # ---------------------------------------------------------------------------
 
-# Narration_chunk and stream_chunk are capped lower than MAX_EVENTS_PER_CYCLE
-# and paced with a small per-char sleep so both the narration typewriter and
-# the raw-JSON stream reveal smoothly on screen instead of jumping in large
-# blocks. stream_chunk deltas arrive unpaced from a real ai& call and can
-# burst dozens of times per second — without this cap each burst triggers a
-# full feed re-render (st.html() redraws the whole .aos-feed div every
-# rerun), which is what caused visible flashing during real (non-mock) runs.
-# Non-narration/stream events still process at full speed within the cycle.
-MAX_NARRATION_CHARS_PER_CYCLE = 15
-NARRATION_CHAR_DELAY_S = 0.01
-MAX_STREAM_CHARS_PER_CYCLE = 15
-STREAM_CHAR_DELAY_S = 0.01
+# The iframe sources events.json from Streamlit's static file server
+# (dashboard/static/events.json → /app/static/events.json).
+# It keeps its own byte cursor and uses Range requests to fetch only new bytes,
+# exactly mirroring the Python read_new_events() approach.
+
+_FEED_IFRAME = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --color-accent: #b68235;
+  --danger: #e53935;
+  --safe: #43a047;
+  --feed-bg: #1e1e2e;
+  --feed-text: rgba(248,244,244,0.92);
+  --feed-muted: rgba(248,244,244,0.55);
+  --feed-divider: rgba(248,244,244,0.16);
+  --font-heading: 'Cormorant Garamond', Georgia, serif;
+  --font-body: 'Lora', Georgia, serif;
+}
+
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600&family=Lora:wght@400;600&display=swap');
+
+@keyframes livePulse { 0%,100%{opacity:1}50%{opacity:.25} }
+@keyframes caretBlink { 0%,49%{opacity:1}50%,100%{opacity:0} }
+@keyframes feedIn { from{opacity:0;transform:translateY(14px)} to{opacity:1;transform:translateY(0)} }
+
+body {
+  background: var(--feed-bg);
+  font-family: var(--font-body);
+  color: var(--feed-text);
+  padding: 24px;
+  min-height: 100vh;
+  overflow-y: auto;
+}
+
+#feed { display: flex; flex-direction: column; gap: 18px; }
+
+.aos-feed-empty { color: var(--feed-muted); font-style: italic; }
+
+.aos-divider { display:flex;align-items:center;gap:14px;margin:6px 0;animation:feedIn .5s ease both; }
+.aos-divider-line { flex:1;height:1px;background:var(--feed-divider); }
+.aos-divider-label {
+  font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+  white-space:nowrap;font-family:var(--font-heading);font-weight:600;
+}
+
+.aos-narration { display:flex;flex-direction:column;gap:8px;animation:feedIn .5s ease both; }
+.aos-role-tag {
+  font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;font-weight:600;
+  border-radius:3px;padding:2px 8px;width:fit-content;border:1px solid currentColor;
+}
+.aos-role-tag.attacker { color:var(--danger); }
+.aos-role-tag.defender { color:var(--safe); }
+.aos-quote {
+  font-family:var(--font-heading);font-style:italic;font-weight:600;
+  font-size:24px;line-height:1.4;color:var(--feed-text);
+}
+.aos-caret { animation:caretBlink .9s step-end infinite;color:var(--color-accent); }
+.aos-technical {
+  font-family:ui-monospace,Menlo,monospace;font-size:11.5px;
+  line-height:1.6;color:var(--feed-muted);white-space:pre-wrap;
+}
+
+.aos-taunt {
+  display:flex;flex-direction:column;gap:6px;
+  padding-left:18px;border-left:2px dashed var(--danger);animation:feedIn .5s ease both;
+}
+.aos-taunt-tag { font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--danger);width:fit-content; }
+.aos-taunt-text { font-family:ui-monospace,Menlo,monospace;font-size:13px;font-style:italic;color:var(--feed-muted); }
+
+.aos-wire { display:flex;flex-direction:column;gap:8px;padding-left:14px;animation:feedIn .5s ease both; }
+.aos-wire.blocked { border-left:3px solid var(--safe); }
+.aos-wire.breach  { border-left:3px solid var(--danger); }
+.aos-wire-header  { display:flex;align-items:center;gap:8px; }
+.aos-wire-dot     { width:7px;height:7px;border-radius:50%; }
+.aos-wire.blocked .aos-wire-dot  { background:var(--safe); }
+.aos-wire.breach  .aos-wire-dot  { background:var(--danger); }
+.aos-wire-label   { font-size:11px;letter-spacing:.06em;text-transform:uppercase;font-weight:600; }
+.aos-wire.blocked .aos-wire-label { color:var(--safe); }
+.aos-wire.breach  .aos-wire-label { color:var(--danger); }
+.aos-wire-block {
+  font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.6;
+  white-space:pre-wrap;word-break:break-all;color:var(--feed-text);
+  background:rgba(255,255,255,.04);border:1px solid var(--feed-divider);
+  border-radius:4px;padding:10px 12px;
+}
+.aos-wire-curl { color:var(--color-accent);border-color:var(--color-accent); }
+
+.aos-live-timer {
+  display:flex;align-items:center;gap:8px;
+  font-family:ui-monospace,Menlo,monospace;font-size:12px;
+  color:var(--color-accent);animation:feedIn .5s ease both;
+}
+.aos-live-timer-dot { width:6px;height:6px;border-radius:50%;background:var(--color-accent);animation:livePulse 1.1s ease-in-out infinite; }
+
+.aos-diff {
+  display:flex;flex-direction:column;gap:4px;
+  font-family:ui-monospace,Menlo,monospace;font-size:12px;line-height:1.7;
+  background:rgba(255,255,255,.04);border:1px solid var(--feed-divider);
+  border-radius:4px;padding:12px 14px;animation:feedIn .5s ease both;
+}
+.aos-diff-kicker { font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--color-accent);margin-bottom:4px; }
+.aos-diff-line { padding-left:8px;white-space:pre-wrap;word-break:break-all; }
+.aos-diff-line.add { color:var(--safe);border-left:2px solid var(--safe); }
+.aos-diff-line.del { color:var(--danger);border-left:2px solid var(--danger); }
+.aos-diff-line.ctx { color:var(--feed-text);border-left:2px solid transparent; }
+</style>
+</head>
+<body>
+<div id="feed"><div class="aos-feed-empty">Waiting for the first iteration…</div></div>
+<script>
+(function() {
+'use strict';
+
+// ── constants ──────────────────────────────────────────────────────────────
+var EVENTS_URL = '/app/static/events.json';
+var POLL_MS    = 120;
+var CHAR_MS    = 28;   // typewriter speed
+
+var VULN_LABELS = {sqli:'SQL Injection', idor:'IDOR', missing_auth:'Missing Auth'};
+var TAUNTS = {
+  sqli:         "Thanks for the login — didn't even need a password.",
+  idor:         "Appreciate Annie's notes — didn't need to be her to read them.",
+  missing_auth: "Reset's done — nobody even asked who I was."
+};
+var STAGE_COLORS = {
+  idle:'#9b9797', pending:'#9b9797', scanning:'#b68235',
+  breached:'#e53935', analysing:'#b68235', patched:'#b68235', verified:'#43a047'
+};
+var ROUND_NUMS = {1:'I', 2:'II', 3:'III'};
+
+// ── state ──────────────────────────────────────────────────────────────────
+var cursor = 0;
+
+// per-iteration live state
+var state = {
+  iteration: 0,
+  stage: 'idle',
+  vuln_class: '',
+  active_agent: null,
+  attacker_narration: '',
+  attacker_technical: '',
+  defender_narration: '',
+  defender_technical: '',
+  wire_request: null,
+  wire_response: null,
+  wire_blocked: null,
+  diff: '',
+  frozen: false
+};
+
+// queued narration characters waiting to be typed
+var narratQueue = [];  // [{agent, char}]
+var typingActive = false;
+
+// ── DOM refs (created lazily, one per iteration) ───────────────────────────
+var dom = {};  // keys: divider, atk_narration, atk_quote, atk_caret, atk_technical,
+               //       atk_timer, wire_breach, taunt, def_narration, def_quote,
+               //       def_caret, def_technical, def_timer, diff_block, wire_verify
+
+var feed = document.getElementById('feed');
+
+// ── helpers ────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function el(tag, cls, style) {
+  var e = document.createElement(tag);
+  if (cls)   e.className = cls;
+  if (style) e.style.cssText = style;
+  return e;
+}
+
+function append(parent, child) { parent.appendChild(child); return child; }
+
+function clearEmpty() {
+  var emp = feed.querySelector('.aos-feed-empty');
+  if (emp) emp.remove();
+}
+
+function scrollToBottom() {
+  feed.lastElementChild && feed.lastElementChild.scrollIntoView({behavior:'smooth', block:'end'});
+}
+
+// ── timer ──────────────────────────────────────────────────────────────────
+function startTimer(el) {
+  var start = performance.now();
+  function tick() {
+    if (!el || !document.body.contains(el)) return;
+    el.textContent = ((performance.now() - start) / 1000).toFixed(2) + 's';
+    setTimeout(tick, 100);
+  }
+  tick();
+}
+
+// ── block builders ─────────────────────────────────────────────────────────
+function makeDivider(text, color) {
+  var d = el('div','aos-divider');
+  var l1 = append(d, el('div','aos-divider-line'));
+  var lb = append(d, el('div','aos-divider-label'));
+  lb.style.color = color;
+  lb.textContent = text;
+  var l2 = append(d, el('div','aos-divider-line'));
+  return d;
+}
+
+function makeNarrationBlock(agent) {
+  var wrap = el('div','aos-narration');
+  var tag  = append(wrap, el('span','aos-role-tag ' + agent));
+  tag.textContent = agent === 'attacker' ? 'Attacker' : 'Defender';
+  var quote = append(wrap, el('div','aos-quote'));
+  quote.innerHTML = '"<span class="aos-narration-text"></span><span class="aos-caret">▌</span>"';
+  var tech  = append(wrap, el('div','aos-technical'));
+  tech.style.display = 'none';
+  return {wrap, quote, text: quote.querySelector('.aos-narration-text'),
+          caret: quote.querySelector('.aos-caret'), tech};
+}
+
+function makeTimerBlock(agent) {
+  var wrap = el('div','aos-live-timer');
+  append(wrap, el('div','aos-live-timer-dot'));
+  var tag = append(wrap, el('span','aos-role-tag ' + agent));
+  tag.textContent = agent === 'attacker' ? 'Attacker' : 'Defender';
+  var lbl = append(wrap, el('span'));
+  lbl.textContent = 'requesting deepseek-v4-flash…';
+  var clk = append(wrap, el('span'));
+  clk.textContent = '0.00s';
+  startTimer(clk);
+  return wrap;
+}
+
+function formatRequest(req) {
+  if (!req) return '';
+  var lines = [req.method + ' ' + req.url];
+  var hdrs = req.headers || {};
+  Object.keys(hdrs).forEach(function(k){ lines.push(k + ': ' + hdrs[k]); });
+  if (req.body != null) {
+    lines.push('');
+    lines.push(typeof req.body === 'object' ? JSON.stringify(req.body, null, 2) : String(req.body));
+  }
+  return lines.join('\\n');
+}
+
+function formatCurl(req) {
+  if (!req) return '';
+  var parts = ["curl -X " + req.method + " '" + req.url + "'"];
+  var hdrs = req.headers || {};
+  Object.keys(hdrs).forEach(function(k){ parts.push("  -H '" + k + ": " + hdrs[k] + "'"); });
+  if (req.body != null) {
+    var b = typeof req.body === 'object' ? JSON.stringify(req.body) : String(req.body);
+    parts.push("  -d '" + b.replace(/'/g, "'\\\\''") + "'");
+  }
+  return parts.join(' \\\\\\n');
+}
+
+function formatResponse(resp) {
+  if (!resp) return '';
+  var body = typeof resp.body === 'object' ? JSON.stringify(resp.body, null, 2) : String(resp.body || '');
+  return 'HTTP ' + resp.status + '\\n\\n' + body;
+}
+
+function makeWireBlock(req, resp, blocked) {
+  var cls   = blocked ? 'blocked' : 'breach';
+  var label = blocked ? 'Exploit blocked — patch holds' : 'Breach confirmed';
+  var wrap  = el('div','aos-wire ' + cls);
+  var hdr   = append(wrap, el('div','aos-wire-header'));
+  append(hdr, el('div','aos-wire-dot'));
+  var lbl = append(hdr, el('span','aos-wire-label'));
+  lbl.textContent = label;
+  var curl = append(wrap, el('div','aos-wire-block aos-wire-curl'));
+  curl.textContent = '$ ' + formatCurl(req);
+  var reqB = append(wrap, el('div','aos-wire-block'));
+  reqB.textContent = formatRequest(req);
+  var resB = append(wrap, el('div','aos-wire-block'));
+  resB.textContent = formatResponse(resp);
+  return wrap;
+}
+
+function makeTauntBlock(text) {
+  var wrap = el('div','aos-taunt');
+  var tag  = append(wrap, el('span','aos-taunt-tag'));
+  tag.textContent = 'Attacker → Defender';
+  var txt  = append(wrap, el('div','aos-taunt-text'));
+  txt.textContent = text;
+  return wrap;
+}
+
+function makeDiffBlock(endpoint, diff) {
+  var wrap   = el('div','aos-diff');
+  var kicker = append(wrap, el('div','aos-diff-kicker'));
+  kicker.textContent = endpoint + ' — patch applied';
+  diff.split('\\n').forEach(function(line) {
+    var cls = '';
+    if (/^(\\+\\+\\+|---|@@)/.test(line)) return;
+    if (line.startsWith('+')) cls = 'add';
+    else if (line.startsWith('-')) cls = 'del';
+    else cls = 'ctx';
+    var row = append(wrap, el('div','aos-diff-line ' + cls));
+    row.textContent = line;
+  });
+  return wrap;
+}
+
+// ── iteration DOM setup ────────────────────────────────────────────────────
+function setupIterationDOM() {
+  // called once per iteration_start — creates the divider and clears dom refs
+  dom = {};
+
+  // if this is the very first iteration of a new run, wipe the feed
+  if (state.iteration === 1) {
+    feed.innerHTML = '';
+  }
+  clearEmpty();
+
+  var vc = VULN_LABELS[state.vuln_class] || state.vuln_class;
+  var color = STAGE_COLORS['scanning'];
+  dom.divider = append(feed, makeDivider(
+    'Iteration ' + state.iteration + ' — ' + vc, color
+  ));
+}
+
+function updateDivider() {
+  if (!dom.divider) return;
+  var vc = VULN_LABELS[state.vuln_class] || state.vuln_class;
+  var color, text;
+  if (state.stage === 'verified') {
+    color = state.wire_blocked ? 'var(--safe)' : 'var(--danger)';
+    text  = 'Iteration ' + state.iteration + ' complete — ' + vc;
+  } else {
+    color = STAGE_COLORS[state.stage] || '#9b9797';
+    text  = 'Iteration ' + state.iteration + ' — ' + vc;
+  }
+  dom.divider.querySelector('.aos-divider-label').textContent = text;
+  dom.divider.querySelector('.aos-divider-label').style.color = color;
+}
+
+// ── narration typewriter ───────────────────────────────────────────────────
+function pumpNarration() {
+  if (!narratQueue.length) { typingActive = false; return; }
+  typingActive = true;
+  var item = narratQueue.shift();
+  var agent = item.agent;
+
+  if (agent === 'attacker') {
+    state.attacker_narration += item.char;
+    if (!dom.atk_narration) {
+      // first char — swap timer for narration block
+      if (dom.atk_timer) { dom.atk_timer.remove(); dom.atk_timer = null; }
+      var nb = makeNarrationBlock('attacker');
+      dom.atk_narration = nb.wrap;
+      dom.atk_quote     = nb.quote;
+      dom.atk_text      = nb.text;
+      dom.atk_caret     = nb.caret;
+      dom.atk_technical = nb.tech;
+      // insert after divider
+      if (dom.divider && dom.divider.nextSibling) {
+        feed.insertBefore(dom.atk_narration, dom.divider.nextSibling);
+      } else {
+        feed.appendChild(dom.atk_narration);
+      }
+    }
+    dom.atk_text.textContent = state.attacker_narration;
+  } else {
+    state.defender_narration += item.char;
+    if (!dom.def_narration) {
+      if (dom.def_timer) { dom.def_timer.remove(); dom.def_timer = null; }
+      var nb2 = makeNarrationBlock('defender');
+      dom.def_narration = nb2.wrap;
+      dom.def_quote     = nb2.quote;
+      dom.def_text      = nb2.text;
+      dom.def_caret     = nb2.caret;
+      dom.def_technical = nb2.tech;
+      feed.appendChild(dom.def_narration);
+    }
+    dom.def_text.textContent = state.defender_narration;
+  }
+
+  setTimeout(pumpNarration, CHAR_MS);
+}
+
+// ── event handlers ─────────────────────────────────────────────────────────
+function handleEvent(ev) {
+  var t = ev.type || '';
+  var p = ev.payload || {};
+
+  if (t === 'iteration_start') {
+    state.iteration          = ev.iteration || state.iteration;
+    state.vuln_class         = ev.vulnerability_class || '';
+    state.stage              = 'scanning';
+    state.active_agent       = null;
+    state.attacker_narration = '';
+    state.attacker_technical = '';
+    state.defender_narration = '';
+    state.defender_technical = '';
+    state.wire_request       = null;
+    state.wire_response      = null;
+    state.wire_blocked       = null;
+    state.diff               = '';
+    state.frozen             = false;
+    narratQueue              = [];
+    dom                      = {};
+    setupIterationDOM();
+
+  } else if (t === 'agent_thinking') {
+    state.active_agent = p.agent;
+    if (p.agent === 'defender') state.stage = 'analysing';
+
+    if (p.agent === 'attacker' && !dom.atk_timer && !dom.atk_narration) {
+      dom.atk_timer = append(feed, makeTimerBlock('attacker'));
+    } else if (p.agent === 'defender' && !dom.def_timer && !dom.def_narration) {
+      dom.def_timer = append(feed, makeTimerBlock('defender'));
+    }
+    updateDivider();
+
+  } else if (t === 'narration_chunk') {
+    narratQueue.push({agent: p.agent, char: p.char || ''});
+    if (!typingActive) pumpNarration();
+
+  } else if (t === 'stream_chunk') {
+    // not displayed — just consume
+
+  } else if (t === 'attack_sent') {
+    state.stage              = 'breached';
+    state.wire_request       = p.request;
+    state.wire_response      = p.response;
+    state.wire_blocked       = false;
+    state.active_agent       = null;
+    // finalize attacker narration from agent_reasoning (in case no narration_chunks came through)
+    var r = p.agent_reasoning || {};
+    if (!state.attacker_narration && r.narration) {
+      state.attacker_narration = r.narration;
+    }
+    state.attacker_technical = r.technical || '';
+    narratQueue = [];
+    typingActive = false;
+
+    // complete the attacker narration block if it exists
+    if (dom.atk_timer) { dom.atk_timer.remove(); dom.atk_timer = null; }
+    if (!dom.atk_narration && state.attacker_narration) {
+      var nb3 = makeNarrationBlock('attacker');
+      dom.atk_narration = nb3.wrap; dom.atk_quote = nb3.quote;
+      dom.atk_text = nb3.text; dom.atk_caret = nb3.caret; dom.atk_technical = nb3.tech;
+      if (dom.divider && dom.divider.nextSibling) feed.insertBefore(dom.atk_narration, dom.divider.nextSibling);
+      else feed.appendChild(dom.atk_narration);
+    }
+    if (dom.atk_text) dom.atk_text.textContent = state.attacker_narration;
+    if (dom.atk_caret) dom.atk_caret.style.display = 'none';
+    if (dom.atk_technical && state.attacker_technical) {
+      dom.atk_technical.textContent = state.attacker_technical;
+      dom.atk_technical.style.display = '';
+    }
+
+    // append wire block (breach)
+    if (!dom.wire_breach) {
+      dom.wire_breach = append(feed, makeWireBlock(p.request, p.response, false));
+      scrollToBottom();
+    }
+    updateDivider();
+
+  } else if (t === 'patch_applied') {
+    state.stage              = 'patched';
+    state.diff               = p.diff || '';
+    state.active_agent       = null;
+    var r2 = p.agent_reasoning || {};
+    if (!state.defender_narration && r2.narration) {
+      state.defender_narration = r2.narration;
+    }
+    state.defender_technical = r2.technical || '';
+    narratQueue = [];
+    typingActive = false;
+
+    // append taunt if not already there
+    var taunt = TAUNTS[state.vuln_class];
+    if (taunt && !dom.taunt) {
+      dom.taunt = append(feed, makeTauntBlock(taunt));
+      scrollToBottom();
+    }
+
+    // complete defender narration block
+    if (dom.def_timer) { dom.def_timer.remove(); dom.def_timer = null; }
+    if (!dom.def_narration && state.defender_narration) {
+      var nb4 = makeNarrationBlock('defender');
+      dom.def_narration = nb4.wrap; dom.def_quote = nb4.quote;
+      dom.def_text = nb4.text; dom.def_caret = nb4.caret; dom.def_technical = nb4.tech;
+      feed.appendChild(dom.def_narration);
+    }
+    if (dom.def_text) dom.def_text.textContent = state.defender_narration;
+    if (dom.def_caret) dom.def_caret.style.display = 'none';
+    if (dom.def_technical && state.defender_technical) {
+      dom.def_technical.textContent = state.defender_technical;
+      dom.def_technical.style.display = '';
+    }
+
+    // diff block
+    if (state.diff && !dom.diff_block) {
+      var endpoint = state.wire_request ? state.wire_request.url : '';
+      dom.diff_block = append(feed, makeDiffBlock(endpoint, state.diff));
+      scrollToBottom();
+    }
+    updateDivider();
+
+  } else if (t === 'verified') {
+    state.stage        = 'verified';
+    state.wire_request = p.request;
+    state.wire_response= p.response;
+    state.wire_blocked = p.exploit_blocked || false;
+
+    // verified wire block
+    if (!dom.wire_verify) {
+      dom.wire_verify = append(feed, makeWireBlock(p.request, p.response, p.exploit_blocked));
+    }
+    // update breach wire to show final blocked state if it was blocked
+    updateDivider();
+
+    // scroll into view
+    scrollToBottom();
+
+  } else if (t === 'iteration_complete') {
+    state.frozen       = true;
+    state.active_agent = null;
+    // hide remaining carets
+    if (dom.atk_caret) dom.atk_caret.style.display = 'none';
+    if (dom.def_caret) dom.def_caret.style.display = 'none';
+  }
+}
+
+// ── poller ─────────────────────────────────────────────────────────────────
+function poll() {
+  var headers = {};
+  if (cursor > 0) headers['Range'] = 'bytes=' + cursor + '-';
+
+  fetch(EVENTS_URL, {headers: headers, cache: 'no-store'})
+    .then(function(r) {
+      // 416 = range not satisfiable — file was reset/truncated, restart from 0
+      if (r.status === 416) { cursor = 0; setTimeout(poll, POLL_MS); return null; }
+      if (!r.ok && r.status !== 206) { setTimeout(poll, POLL_MS); return null; }
+      // get Content-Range to update cursor correctly
+      var contentRange = r.headers.get('Content-Range');
+      return r.text().then(function(text) {
+        if (!text) { setTimeout(poll, POLL_MS); return; }
+        // update cursor: if we got a Content-Range header use it,
+        // otherwise just advance by bytes received
+        if (contentRange) {
+          var m = contentRange.match(/bytes \\d+-\\d+\\/(\\d+)/);
+          if (m) cursor = parseInt(m[1], 10);
+        } else {
+          // full file response (first fetch or no Range support)
+          cursor += new TextEncoder().encode(text).length;
+        }
+        text.split('\\n').forEach(function(line) {
+          line = line.trim();
+          if (!line) return;
+          try { handleEvent(JSON.parse(line)); } catch(e) {}
+        });
+        setTimeout(poll, POLL_MS);
+      });
+    })
+    .catch(function() { setTimeout(poll, POLL_MS * 3); });
+}
+
+poll();
+})();
+</script>
+</body>
+</html>"""
 
 
-def _process_events_this_cycle(events: list[dict]) -> list[dict]:
-    """Apply events up to the per-cycle caps, returning any left for next cycle."""
-    narration_chars_used = 0
-    stream_chars_used = 0
-    processed = 0
-    for event in events:
-        event_type = event.get("type")
-        if event_type == "narration_chunk":
-            if narration_chars_used >= MAX_NARRATION_CHARS_PER_CYCLE:
-                break
-            apply_event(event)
-            narration_chars_used += 1
-            processed += 1
-            time.sleep(NARRATION_CHAR_DELAY_S)
-        elif event_type == "stream_chunk":
-            if stream_chars_used >= MAX_STREAM_CHARS_PER_CYCLE:
-                break
-            apply_event(event)
-            stream_chars_used += len(event.get("payload", {}).get("chunk", ""))
-            processed += 1
-            time.sleep(STREAM_CHAR_DELAY_S)
-        else:
-            if processed >= MAX_EVENTS_PER_CYCLE:
-                break
-            apply_event(event)
-            processed += 1
-    return events[processed:]
+# Process-level flag — True once per Streamlit process lifetime, not per session.
+# Ensures stale events files are wiped whenever Streamlit (re)starts.
+_STARTUP_CLEARED = False
+
+
+def _clear_on_startup() -> None:
+    global _STARTUP_CLEARED
+    for p in (EVENTS_PATH, STATIC_EVENTS_PATH):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+    _STARTUP_CLEARED = True
+
+
+@st.fragment(run_every=POLL_INTERVAL_S)
+def _updatable_shell() -> None:
+    """Fragment that reruns every POLL_INTERVAL_S to update sidebar + nav/gallery.
+
+    Using @st.fragment means only this function reruns on the poll timer —
+    the iframe rendered outside it is never touched, so its JS state
+    (typewriter position, DOM, cursor) persists across updates.
+    """
+    sync_events_file()
+    _scan_new_events()
+    render_sidebar()
+    render_nav_and_gallery()
 
 
 def main() -> None:
@@ -1045,32 +1364,23 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
     init_state()
-    inject_css()
+    inject_shell_css()
 
-    # ---- poll events -------------------------------------------------------
-    new_events = read_new_events()
-    got_events = bool(new_events)
+    # On the very first run of this Streamlit process (tracked by a process-level
+    # flag, not session state), wipe both events files so the iframe never
+    # replays a stale previous run after Streamlit restarts.
+    if not _STARTUP_CLEARED:
+        _clear_on_startup()
 
-    remaining = _process_events_this_cycle(new_events)
+    # Fragment handles sidebar + nav/gallery + events sync on a timer.
+    # It reruns independently — the iframe below is never re-rendered.
+    _updatable_shell()
 
-    # If we capped, put remaining back by rewinding the cursor
-    if remaining:
-        rewind = sum(len(json.dumps(e).encode()) + 1 for e in remaining)
-        st.session_state.cursor = max(0, st.session_state.cursor - rewind)
-
-    # ---- layout ------------------------------------------------------------
-    render_sidebar()
-    render_nav_bar()
-    render_round_gallery()
     st.divider()
-    render_feed()
 
-    # ---- rerun loop --------------------------------------------------------
-    if got_events:
-        st.rerun()
-    else:
-        time.sleep(POLL_INTERVAL_S)
-        st.rerun()
+    # Iframe rendered once at page load. Its JS polls events.json directly
+    # and never needs a Python rerun to update.
+    st.iframe(_FEED_IFRAME, height=900)
 
 
 if __name__ == "__main__":

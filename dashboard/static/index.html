@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Attack on Sandbox</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600&family=Lora:ital,wght@0,400;0,600;1,400;1,600&display=swap" rel="stylesheet">
+<style>
+/* ── reset ─────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* ── tokens ────────────────────────────────────────────────────────────── */
+:root {
+  --bg:           #f3f2f2;
+  --text:         #201f1d;
+  --accent:       #b68235;
+  --divider:      rgba(32,31,29,0.16);
+  --muted:        rgba(32,31,29,0.55);
+  --danger:       #e53935;
+  --safe:         #43a047;
+  --feed-bg:      #1e1e2e;
+  --feed-text:    rgba(248,244,244,0.92);
+  --feed-muted:   rgba(248,244,244,0.55);
+  --feed-divider: rgba(248,244,244,0.16);
+  --sidebar-w:    240px;
+  --font-head:    'Cormorant Garamond', Georgia, serif;
+  --font-body:    'Lora', Georgia, serif;
+  --font-mono:    ui-monospace, 'SF Mono', Consolas, monospace;
+}
+
+/* ── layout ────────────────────────────────────────────────────────────── */
+html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: var(--font-body); }
+
+#layout { display: flex; height: 100vh; }
+
+/* ── sidebar ───────────────────────────────────────────────────────────── */
+#sidebar {
+  width: var(--sidebar-w);
+  flex: none;
+  background: var(--feed-bg);
+  color: var(--feed-text);
+  padding: 20px 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sb-title {
+  font-family: var(--font-head); font-weight: 600; font-size: 15px;
+  letter-spacing: 0.02em; margin-bottom: 2px; color: var(--feed-text);
+}
+.sb-usage {
+  font-family: var(--font-mono); font-size: 10.5px;
+  color: var(--feed-muted); margin-bottom: 8px;
+}
+.sb-empty { font-style: italic; font-size: 12px; color: var(--feed-muted); margin-top: 4px; }
+
+.sbox-card {
+  display: flex; flex-direction: column; gap: 5px;
+  padding: 10px 12px; margin-bottom: 8px;
+  border: 1px solid rgba(248,244,244,0.16); border-radius: 6px;
+  background: rgba(255,255,255,0.03);
+}
+.sbox-card.running  { border-color: var(--accent); }
+.sbox-card.verified { border-color: var(--safe); }
+.sbox-card.destroyed { opacity: 0.55; }
+.sbox-id {
+  font-size: 10px; letter-spacing: 0.03em; padding: 2px 8px; border-radius: 3px;
+  border: 1px solid var(--accent); color: var(--accent); width: fit-content;
+  word-break: break-all;
+}
+.sbox-url { font-family: var(--font-mono); font-size: 10px; color: var(--feed-muted); word-break: break-all; }
+.sbox-meta { font-family: var(--font-mono); font-size: 10px; color: var(--feed-muted); }
+.sbox-status { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
+.sbox-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
+@keyframes pulse { 0%,100%{opacity:1}50%{opacity:.25} }
+.sbox-card.running  .sbox-dot  { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+.sbox-card.verified .sbox-dot  { background: var(--safe); }
+.sbox-card.destroyed .sbox-dot { background: var(--feed-muted); }
+.sbox-card.running  .sbox-status { color: var(--accent); }
+.sbox-card.verified .sbox-status { color: var(--safe); }
+.sbox-card.destroyed .sbox-status { color: var(--feed-muted); }
+
+/* ── main column ───────────────────────────────────────────────────────── */
+#main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+/* ── nav ────────────────────────────────────────────────────────────────── */
+#nav {
+  flex: none;
+  padding: 16px 24px 12px;
+  border-bottom: 1px solid var(--divider);
+  background: var(--bg);
+}
+.nav-top {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  margin-bottom: 10px;
+}
+.brand { font-family: var(--font-head); font-weight: 600; font-size: 18px; }
+.tagline { font-size: 11px; color: var(--muted); letter-spacing: 0.02em; }
+.nav-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.tag {
+  display: inline-flex; align-items: center; font-size: 11px;
+  padding: 3px 10px; border-radius: 3px;
+  border: 1px solid var(--accent); color: var(--accent);
+}
+.usage-line { font-size: 11px; color: var(--muted); }
+
+/* iteration cards */
+#rounds { display: flex; gap: 12px; }
+.round-card {
+  flex: 1; display: flex; align-items: center; gap: 12px;
+  padding: 10px 16px; border-radius: 4px;
+  border: 1px solid var(--divider);
+  transition: border-color 0.3s;
+}
+.round-numeral { font-family: var(--font-head); font-weight: 600; font-size: 26px; width: 30px; flex: none; color: rgba(32,31,29,0.35); transition: color 0.3s; }
+.round-title   { font-family: var(--font-head); font-weight: 600; font-size: 15px; flex: 1; }
+.round-stage   {
+  font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  padding: 3px 9px; border-radius: 3px; border: 1px solid currentColor;
+  flex: none; white-space: nowrap; transition: color 0.3s;
+}
+
+/* action buttons */
+#actions { display: flex; gap: 8px; margin-top: 10px; }
+button {
+  font-family: var(--font-head); font-size: 14px; letter-spacing: 0.04em;
+  padding: 6px 18px; border-radius: 3px; cursor: pointer;
+  border: 1px solid var(--divider); background: transparent; color: var(--text);
+  transition: border-color 0.2s, color 0.2s;
+}
+button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: default; }
+button.danger { border-color: var(--danger); color: var(--danger); }
+button.danger:hover:not(:disabled) { background: var(--danger); color: #fff; }
+
+/* ── feed ───────────────────────────────────────────────────────────────── */
+#feed-wrap {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--feed-bg);
+  padding: 24px;
+}
+#feed { display: flex; flex-direction: column; gap: 18px; }
+
+.feed-empty { color: var(--feed-muted); font-style: italic; }
+
+@keyframes feedIn { from{opacity:0;transform:translateY(14px)} to{opacity:1;transform:translateY(0)} }
+@keyframes caretBlink { 0%,49%{opacity:1}50%,100%{opacity:0} }
+
+.aos-divider { display:flex;align-items:center;gap:14px;margin:6px 0;animation:feedIn .5s ease both; }
+.aos-divider-line { flex:1;height:1px;background:var(--feed-divider); }
+.aos-divider-label {
+  font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+  white-space:nowrap;font-family:var(--font-head);font-weight:600;
+}
+
+.aos-narration { display:flex;flex-direction:column;gap:8px;animation:feedIn .5s ease both; }
+.aos-role-tag {
+  font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;font-weight:600;
+  border-radius:3px;padding:2px 8px;width:fit-content;border:1px solid currentColor;
+}
+.aos-role-tag.attacker { color:var(--danger); }
+.aos-role-tag.defender { color:var(--safe); }
+.aos-quote {
+  font-family:var(--font-head);font-style:italic;font-weight:600;
+  font-size:24px;line-height:1.4;color:var(--feed-text);
+}
+.aos-caret { animation:caretBlink .9s step-end infinite;color:var(--accent); }
+.aos-technical {
+  font-family:var(--font-mono);font-size:11.5px;
+  line-height:1.6;color:var(--feed-muted);white-space:pre-wrap;
+}
+
+.aos-taunt {
+  display:flex;flex-direction:column;gap:6px;
+  padding-left:18px;border-left:2px dashed var(--danger);animation:feedIn .5s ease both;
+}
+.aos-taunt-tag { font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--danger);width:fit-content; }
+.aos-taunt-text { font-family:var(--font-mono);font-size:13px;font-style:italic;color:var(--feed-muted); }
+
+.aos-wire { display:flex;flex-direction:column;gap:8px;padding-left:14px;animation:feedIn .5s ease both; }
+.aos-wire.blocked { border-left:3px solid var(--safe); }
+.aos-wire.breach  { border-left:3px solid var(--danger); }
+.aos-wire-header  { display:flex;align-items:center;gap:8px; }
+.aos-wire-dot     { width:7px;height:7px;border-radius:50%; }
+.aos-wire.blocked .aos-wire-dot  { background:var(--safe); }
+.aos-wire.breach  .aos-wire-dot  { background:var(--danger); }
+.aos-wire-label   { font-size:11px;letter-spacing:.06em;text-transform:uppercase;font-weight:600; }
+.aos-wire.blocked .aos-wire-label { color:var(--safe); }
+.aos-wire.breach  .aos-wire-label { color:var(--danger); }
+.aos-wire-block {
+  font-family:var(--font-mono);font-size:11.5px;line-height:1.6;
+  white-space:pre-wrap;word-break:break-all;color:var(--feed-text);
+  background:rgba(255,255,255,.04);border:1px solid var(--feed-divider);
+  border-radius:4px;padding:10px 12px;
+}
+.aos-wire-curl { color:var(--accent);border-color:var(--accent); }
+
+.aos-live-timer {
+  display:flex;align-items:center;gap:8px;
+  font-family:var(--font-mono);font-size:12px;
+  color:var(--accent);animation:feedIn .5s ease both;
+}
+.aos-live-timer-dot { width:6px;height:6px;border-radius:50%;background:var(--accent);animation:pulse 1.1s ease-in-out infinite; }
+
+.aos-diff {
+  display:flex;flex-direction:column;gap:4px;
+  font-family:var(--font-mono);font-size:12px;line-height:1.7;
+  background:rgba(255,255,255,.04);border:1px solid var(--feed-divider);
+  border-radius:4px;padding:12px 14px;animation:feedIn .5s ease both;
+}
+.aos-diff-kicker { font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);margin-bottom:4px; }
+.aos-diff-line { padding-left:8px;white-space:pre-wrap;word-break:break-all; }
+.aos-diff-line.add { color:var(--safe);border-left:2px solid var(--safe); }
+.aos-diff-line.del { color:var(--danger);border-left:2px solid var(--danger); }
+.aos-diff-line.ctx { color:var(--feed-text);border-left:2px solid transparent; }
+</style>
+</head>
+<body>
+<div id="layout">
+
+  <!-- sidebar -->
+  <div id="sidebar">
+    <div class="sb-title">Daytona sandboxes</div>
+    <div class="sb-usage" id="sb-usage" style="display:none"></div>
+    <div class="sb-empty" id="sb-empty">Waiting for the first sandbox…</div>
+    <div id="sb-cards"></div>
+  </div>
+
+  <!-- main -->
+  <div id="main">
+
+    <!-- nav -->
+    <div id="nav">
+      <div class="nav-top">
+        <div>
+          <div class="brand">Attack on Sandbox</div>
+          <div class="tagline">Two agents. One sandbox. No trust.</div>
+        </div>
+        <div class="nav-right">
+          <span class="tag">Daytona sandbox</span>
+          <span class="tag">ai&amp; · deepseek-v4-flash</span>
+          <span class="usage-line" id="nav-usage" style="display:none"></span>
+        </div>
+      </div>
+      <div id="rounds">
+        <div class="round-card" id="round-1">
+          <div class="round-numeral" id="rn-1">I</div>
+          <div class="round-title">Iteration I</div>
+          <div class="round-stage" id="rs-1" style="color:#9b9797">PENDING</div>
+        </div>
+        <div class="round-card" id="round-2">
+          <div class="round-numeral" id="rn-2">II</div>
+          <div class="round-title">Iteration II</div>
+          <div class="round-stage" id="rs-2" style="color:#9b9797">PENDING</div>
+        </div>
+        <div class="round-card" id="round-3">
+          <div class="round-numeral" id="rn-3">III</div>
+          <div class="round-title">Iteration III</div>
+          <div class="round-stage" id="rs-3" style="color:#9b9797">PENDING</div>
+        </div>
+      </div>
+      <div id="actions">
+        <button id="btn-run" onclick="doRun()">Reset &amp; Run</button>
+        <button id="btn-abort" class="danger" onclick="doAbort()" style="display:none">Abort</button>
+      </div>
+    </div>
+
+    <!-- feed -->
+    <div id="feed-wrap">
+      <div id="feed">
+        <div class="feed-empty">Waiting for the first iteration…</div>
+      </div>
+    </div>
+
+  </div><!-- /main -->
+</div><!-- /layout -->
+
+<script>
+(function() {
+'use strict';
+
+// ── constants ──────────────────────────────────────────────────────────────
+var CHAR_MS = 28;
+
+var VULN_LABELS = {sqli:'SQL Injection', idor:'IDOR', missing_auth:'Missing Auth'};
+var TAUNTS = {
+  sqli:         "Thanks for the login — didn't even need a password.",
+  idor:         "Appreciate Annie's notes — didn't need to be her to read them.",
+  missing_auth: "Reset's done — nobody even asked who I was."
+};
+var STAGE_COLORS = {
+  idle:'#9b9797', pending:'#9b9797', scanning:'#b68235',
+  breached:'#e53935', analysing:'#b68235', patched:'#b68235', verified:'#43a047'
+};
+
+// ── UI state ───────────────────────────────────────────────────────────────
+var appState = {
+  running: false,
+  llm_calls: 0,
+  llm_tokens: 0,
+  iteration: 0,
+  iterations: {1:{stage:'pending'}, 2:{stage:'pending'}, 3:{stage:'pending'}},
+  sandbox_history: []
+};
+
+// ── feed state ─────────────────────────────────────────────────────────────
+var feedState = {
+  iteration: 0, stage: 'idle', vuln_class: '',
+  attacker_narration: '', attacker_technical: '',
+  defender_narration: '', defender_technical: '',
+  wire_request: null, wire_response: null, wire_blocked: null,
+  diff: '', frozen: false
+};
+
+var narratQueue = [];
+var typingActive = false;
+var dom = {};
+
+var feed     = document.getElementById('feed');
+var feedWrap = document.getElementById('feed-wrap');
+
+// ── helpers ────────────────────────────────────────────────────────────────
+function el(tag, cls, style) {
+  var e = document.createElement(tag);
+  if (cls)   e.className = cls;
+  if (style) e.style.cssText = style;
+  return e;
+}
+function append(parent, child) { parent.appendChild(child); return child; }
+function clearEmpty() { var e = feed.querySelector('.feed-empty'); if (e) e.remove(); }
+function scrollToBottom() { feedWrap.scrollTop = feedWrap.scrollHeight; }
+
+// ── timer ──────────────────────────────────────────────────────────────────
+function startTimer(clockEl) {
+  var start = performance.now();
+  (function tick() {
+    if (!document.body.contains(clockEl)) return;
+    clockEl.textContent = ((performance.now() - start) / 1000).toFixed(2) + 's';
+    setTimeout(tick, 100);
+  })();
+}
+
+// ── nav / sidebar rendering ────────────────────────────────────────────────
+function renderNav() {
+  // usage
+  var uEl = document.getElementById('nav-usage');
+  if (appState.llm_calls) {
+    uEl.textContent = appState.llm_calls + ' calls · ' + appState.llm_tokens.toLocaleString() + ' tokens';
+    uEl.style.display = '';
+  }
+  // round cards
+  for (var n = 1; n <= 3; n++) {
+    var stage = appState.iterations[n] ? appState.iterations[n].stage : 'pending';
+    var color = STAGE_COLORS[stage] || '#9b9797';
+    var rsEl = document.getElementById('rs-' + n);
+    var rnEl = document.getElementById('rn-' + n);
+    var cardEl = document.getElementById('round-' + n);
+    rsEl.textContent = stage.toUpperCase();
+    rsEl.style.color = color;
+    rnEl.style.color = (appState.iteration === n) ? color : 'rgba(32,31,29,0.35)';
+    cardEl.style.borderColor = (appState.iteration === n) ? color : '';
+  }
+  // buttons
+  var btnRun   = document.getElementById('btn-run');
+  var btnAbort = document.getElementById('btn-abort');
+  if (appState.running) {
+    btnRun.textContent = 'Running…';
+    btnRun.disabled = true;
+    btnAbort.style.display = '';
+  } else {
+    btnRun.textContent = 'Reset & Run';
+    btnRun.disabled = false;
+    btnAbort.style.display = 'none';
+  }
+}
+
+function renderSidebar() {
+  var usage = document.getElementById('sb-usage');
+  var empty = document.getElementById('sb-empty');
+  var cards = document.getElementById('sb-cards');
+
+  if (appState.llm_calls) {
+    usage.textContent = 'ai& · deepseek-v4-flash · ' + appState.llm_calls + ' calls · ' + appState.llm_tokens.toLocaleString() + ' tokens';
+    usage.style.display = '';
+  }
+
+  if (!appState.sandbox_history.length) {
+    empty.style.display = '';
+    cards.innerHTML = '';
+    return;
+  }
+  empty.style.display = 'none';
+  cards.innerHTML = '';
+  var hist = appState.sandbox_history.slice().reverse();
+  hist.forEach(function(entry) {
+    var status = entry.status || 'running';
+    var vc = VULN_LABELS[entry.vuln_class] || entry.vuln_class || '';
+    var rn = {1:'I',2:'II',3:'III'}[entry.iteration] || entry.iteration || '';
+    var meta = [rn ? 'Iteration ' + rn + (vc ? ' · ' + vc : '') : vc, entry.region].filter(Boolean).join(' · ');
+    var card = el('div', 'sbox-card ' + status);
+    card.innerHTML = [
+      '<div class="sbox-id">' + (entry.id || 'sandbox') + '</div>',
+      entry.url ? '<div class="sbox-url">' + entry.url + '</div>' : '',
+      meta ? '<div class="sbox-meta">' + meta + '</div>' : '',
+      '<div class="sbox-status ' + status + '"><span class="sbox-dot"></span>' + status + '</div>',
+    ].join('');
+    cards.appendChild(card);
+  });
+}
+
+// ── feed block builders ────────────────────────────────────────────────────
+function makeDivider(text, color) {
+  var d = el('div','aos-divider');
+  append(d, el('div','aos-divider-line'));
+  var lb = append(d, el('div','aos-divider-label'));
+  lb.style.color = color; lb.textContent = text;
+  append(d, el('div','aos-divider-line'));
+  return d;
+}
+
+function makeNarrationBlock(agent) {
+  var wrap  = el('div','aos-narration');
+  var tag   = append(wrap, el('span','aos-role-tag ' + agent));
+  tag.textContent = agent === 'attacker' ? 'Attacker' : 'Defender';
+  var quote = append(wrap, el('div','aos-quote'));
+  quote.innerHTML = '&#8220;<span class="aos-narration-text"></span><span class="aos-caret">&#9611;</span>&#8221;';
+  var tech  = append(wrap, el('div','aos-technical'));
+  tech.style.display = 'none';
+  return {wrap, quote, text: quote.querySelector('.aos-narration-text'),
+          caret: quote.querySelector('.aos-caret'), tech};
+}
+
+function makeTimerBlock(agent) {
+  var wrap = el('div','aos-live-timer');
+  append(wrap, el('div','aos-live-timer-dot'));
+  var tag = append(wrap, el('span','aos-role-tag ' + agent));
+  tag.textContent = agent === 'attacker' ? 'Attacker' : 'Defender';
+  var lbl = append(wrap, el('span'));
+  lbl.textContent = ' requesting deepseek-v4-flash… ';
+  var clk = append(wrap, el('span'));
+  clk.textContent = '0.00s';
+  startTimer(clk);
+  return wrap;
+}
+
+function formatRequest(req) {
+  if (!req) return '';
+  var lines = [req.method + ' ' + req.url];
+  Object.keys(req.headers || {}).forEach(function(k){ lines.push(k + ': ' + req.headers[k]); });
+  if (req.body != null) {
+    lines.push('');
+    lines.push(typeof req.body === 'object' ? JSON.stringify(req.body, null, 2) : String(req.body));
+  }
+  return lines.join('\n');
+}
+
+function formatCurl(req) {
+  if (!req) return '';
+  var parts = ['curl -X ' + req.method + " '" + req.url + "'"];
+  Object.keys(req.headers || {}).forEach(function(k){ parts.push("  -H '" + k + ': ' + req.headers[k] + "'"); });
+  if (req.body != null) {
+    var b = typeof req.body === 'object' ? JSON.stringify(req.body) : String(req.body);
+    parts.push("  -d '" + b.replace(/'/g, "'\\''") + "'");
+  }
+  return parts.join(' \\\n');
+}
+
+function formatResponse(resp) {
+  if (!resp) return '';
+  var body = typeof resp.body === 'object' ? JSON.stringify(resp.body, null, 2) : String(resp.body || '');
+  return 'HTTP ' + resp.status + '\n\n' + body;
+}
+
+function makeWireBlock(req, resp, blocked) {
+  var cls   = blocked ? 'blocked' : 'breach';
+  var label = blocked ? 'Exploit blocked — patch holds' : 'Breach confirmed';
+  var wrap  = el('div','aos-wire ' + cls);
+  var hdr   = append(wrap, el('div','aos-wire-header'));
+  append(hdr, el('div','aos-wire-dot'));
+  var lbl = append(hdr, el('span','aos-wire-label'));
+  lbl.textContent = label;
+  var curl = append(wrap, el('div','aos-wire-block aos-wire-curl'));
+  curl.textContent = '$ ' + formatCurl(req);
+  var reqB = append(wrap, el('div','aos-wire-block'));
+  reqB.textContent = formatRequest(req);
+  var resB = append(wrap, el('div','aos-wire-block'));
+  resB.textContent = formatResponse(resp);
+  return wrap;
+}
+
+function makeTauntBlock(text) {
+  var wrap = el('div','aos-taunt');
+  var tag  = append(wrap, el('span','aos-taunt-tag'));
+  tag.textContent = 'Attacker → Defender';
+  var txt  = append(wrap, el('div','aos-taunt-text'));
+  txt.textContent = text;
+  return wrap;
+}
+
+function makeDiffBlock(endpoint, diff) {
+  var wrap   = el('div','aos-diff');
+  var kicker = append(wrap, el('div','aos-diff-kicker'));
+  kicker.textContent = endpoint + ' — patch applied';
+  diff.split('\n').forEach(function(line) {
+    if (/^(\+\+\+|---|@@)/.test(line)) return;
+    var cls = line.startsWith('+') ? 'add' : line.startsWith('-') ? 'del' : 'ctx';
+    var row = append(wrap, el('div','aos-diff-line ' + cls));
+    row.textContent = line;
+  });
+  return wrap;
+}
+
+// ── iteration DOM setup ────────────────────────────────────────────────────
+function setupIterationDOM() {
+  dom = {};
+  if (feedState.iteration === 1) feed.innerHTML = '';
+  clearEmpty();
+  var vc = VULN_LABELS[feedState.vuln_class] || feedState.vuln_class;
+  dom.divider = append(feed, makeDivider('Iteration ' + feedState.iteration + ' — ' + vc, STAGE_COLORS['scanning']));
+}
+
+function updateDivider() {
+  if (!dom.divider) return;
+  var vc = VULN_LABELS[feedState.vuln_class] || feedState.vuln_class;
+  var color, text;
+  if (feedState.stage === 'verified') {
+    color = feedState.wire_blocked ? 'var(--safe)' : 'var(--danger)';
+    text  = 'Iteration ' + feedState.iteration + ' complete — ' + vc;
+  } else {
+    color = STAGE_COLORS[feedState.stage] || '#9b9797';
+    text  = 'Iteration ' + feedState.iteration + ' — ' + vc;
+  }
+  dom.divider.querySelector('.aos-divider-label').textContent = text;
+  dom.divider.querySelector('.aos-divider-label').style.color = color;
+}
+
+// ── narration typewriter ───────────────────────────────────────────────────
+function pumpNarration() {
+  if (!narratQueue.length) { typingActive = false; return; }
+  typingActive = true;
+  var item  = narratQueue.shift();
+  var agent = item.agent;
+
+  if (agent === 'attacker') {
+    feedState.attacker_narration += item.char;
+    if (!dom.atk_narration) {
+      if (dom.atk_timer) { dom.atk_timer.remove(); dom.atk_timer = null; }
+      var nb = makeNarrationBlock('attacker');
+      dom.atk_narration = nb.wrap; dom.atk_text = nb.text;
+      dom.atk_caret = nb.caret; dom.atk_technical = nb.tech;
+      dom.divider && dom.divider.nextSibling
+        ? feed.insertBefore(dom.atk_narration, dom.divider.nextSibling)
+        : feed.appendChild(dom.atk_narration);
+    }
+    dom.atk_text.textContent = feedState.attacker_narration;
+  } else {
+    feedState.defender_narration += item.char;
+    if (!dom.def_narration) {
+      if (dom.def_timer) { dom.def_timer.remove(); dom.def_timer = null; }
+      var nb2 = makeNarrationBlock('defender');
+      dom.def_narration = nb2.wrap; dom.def_text = nb2.text;
+      dom.def_caret = nb2.caret; dom.def_technical = nb2.tech;
+      feed.appendChild(dom.def_narration);
+    }
+    dom.def_text.textContent = feedState.defender_narration;
+  }
+  setTimeout(pumpNarration, CHAR_MS);
+}
+
+// ── event handler ──────────────────────────────────────────────────────────
+function handleEvent(ev) {
+  var t = ev.type || '';
+  var p = ev.payload || {};
+
+  // internal reset signal from server
+  if (t === '_reset') {
+    feed.innerHTML = '<div class="feed-empty">Waiting for the first iteration…</div>';
+    feedState = { iteration:0, stage:'idle', vuln_class:'', attacker_narration:'', attacker_technical:'',
+      defender_narration:'', defender_technical:'', wire_request:null, wire_response:null,
+      wire_blocked:null, diff:'', frozen:false };
+    appState = { running:false, llm_calls:0, llm_tokens:0, iteration:0,
+      iterations:{1:{stage:'pending'},2:{stage:'pending'},3:{stage:'pending'}},
+      sandbox_history:[] };
+    dom = {}; narratQueue = []; typingActive = false;
+    renderNav(); renderSidebar();
+    return;
+  }
+
+  // ── structural events → update nav/sidebar ─────────────────────────────
+  if (t === 'sandbox_ready') {
+    appState.running = true;
+    var entry = {
+      id: p.sandbox_id, url: p.url, region: p.region,
+      status: 'running', vuln_class: '', iteration: 0
+    };
+    appState.sandbox_history.push(entry);
+    renderNav(); renderSidebar();
+    return;
+  }
+
+  if (t === 'iteration_start') {
+    appState.running   = true;
+    appState.iteration = ev.iteration;
+    appState.iterations[ev.iteration] = {stage: 'scanning'};
+    // tag the current sandbox entry
+    var last = appState.sandbox_history[appState.sandbox_history.length - 1];
+    if (last) { last.vuln_class = ev.vulnerability_class; last.iteration = ev.iteration; }
+
+    feedState.iteration          = ev.iteration;
+    feedState.vuln_class         = ev.vulnerability_class || '';
+    feedState.stage              = 'scanning';
+    feedState.attacker_narration = ''; feedState.attacker_technical = '';
+    feedState.defender_narration = ''; feedState.defender_technical = '';
+    feedState.wire_request = null; feedState.wire_response = null;
+    feedState.wire_blocked = null; feedState.diff = ''; feedState.frozen = false;
+    narratQueue = []; dom = {};
+    setupIterationDOM();
+    renderNav(); renderSidebar();
+    return;
+  }
+
+  if (t === 'llm_usage') {
+    appState.llm_calls  += 1;
+    appState.llm_tokens += p.total_tokens || 0;
+    renderNav(); renderSidebar();
+    return;
+  }
+
+  if (t === 'sandbox_destroyed') {
+    var h = appState.sandbox_history.find(function(e){ return e.id === p.sandbox_id; });
+    if (h) h.status = 'destroyed';
+    appState.running = false;
+    renderNav(); renderSidebar();
+    return;
+  }
+
+  if (t === 'iteration_complete') {
+    appState.iterations[ev.iteration] = {stage: 'verified'};
+    feedState.frozen = true;
+    if (dom.atk_caret) dom.atk_caret.style.display = 'none';
+    if (dom.def_caret) dom.def_caret.style.display = 'none';
+    renderNav();
+    return;
+  }
+
+  // ── feed-only events ───────────────────────────────────────────────────
+  if (t === 'agent_thinking') {
+    feedState.stage = p.agent === 'defender' ? 'analysing' : feedState.stage;
+    appState.iterations[feedState.iteration] = {stage: feedState.stage};
+    if (p.agent === 'attacker' && !dom.atk_timer && !dom.atk_narration) {
+      dom.atk_timer = append(feed, makeTimerBlock('attacker'));
+    } else if (p.agent === 'defender' && !dom.def_timer && !dom.def_narration) {
+      dom.def_timer = append(feed, makeTimerBlock('defender'));
+    }
+    updateDivider(); renderNav();
+    return;
+  }
+
+  if (t === 'narration_chunk') {
+    narratQueue.push({agent: p.agent, char: p.char || ''});
+    if (!typingActive) pumpNarration();
+    return;
+  }
+
+  if (t === 'stream_chunk') { return; }
+
+  if (t === 'attack_sent') {
+    feedState.stage = 'breached';
+    feedState.wire_request = p.request; feedState.wire_response = p.response; feedState.wire_blocked = false;
+    appState.iterations[feedState.iteration] = {stage: 'breached'};
+    var r = p.agent_reasoning || {};
+    if (!feedState.attacker_narration && r.narration) feedState.attacker_narration = r.narration;
+    feedState.attacker_technical = r.technical || '';
+    narratQueue = []; typingActive = false;
+    if (dom.atk_timer) { dom.atk_timer.remove(); dom.atk_timer = null; }
+    if (!dom.atk_narration && feedState.attacker_narration) {
+      var nb3 = makeNarrationBlock('attacker');
+      dom.atk_narration = nb3.wrap; dom.atk_text = nb3.text; dom.atk_caret = nb3.caret; dom.atk_technical = nb3.tech;
+      dom.divider && dom.divider.nextSibling ? feed.insertBefore(dom.atk_narration, dom.divider.nextSibling) : feed.appendChild(dom.atk_narration);
+    }
+    if (dom.atk_text) dom.atk_text.textContent = feedState.attacker_narration;
+    if (dom.atk_caret) dom.atk_caret.style.display = 'none';
+    if (dom.atk_technical && feedState.attacker_technical) { dom.atk_technical.textContent = feedState.attacker_technical; dom.atk_technical.style.display = ''; }
+    if (!dom.wire_breach) { dom.wire_breach = append(feed, makeWireBlock(p.request, p.response, false)); scrollToBottom(); }
+    updateDivider(); renderNav();
+    return;
+  }
+
+  if (t === 'patch_applied') {
+    feedState.stage = 'patched'; feedState.diff = p.diff || '';
+    appState.iterations[feedState.iteration] = {stage: 'patched'};
+    var r2 = p.agent_reasoning || {};
+    if (!feedState.defender_narration && r2.narration) feedState.defender_narration = r2.narration;
+    feedState.defender_technical = r2.technical || '';
+    narratQueue = []; typingActive = false;
+    var taunt = TAUNTS[feedState.vuln_class];
+    if (taunt && !dom.taunt) { dom.taunt = append(feed, makeTauntBlock(taunt)); scrollToBottom(); }
+    if (dom.def_timer) { dom.def_timer.remove(); dom.def_timer = null; }
+    if (!dom.def_narration && feedState.defender_narration) {
+      var nb4 = makeNarrationBlock('defender');
+      dom.def_narration = nb4.wrap; dom.def_text = nb4.text; dom.def_caret = nb4.caret; dom.def_technical = nb4.tech;
+      feed.appendChild(dom.def_narration);
+    }
+    if (dom.def_text) dom.def_text.textContent = feedState.defender_narration;
+    if (dom.def_caret) dom.def_caret.style.display = 'none';
+    if (dom.def_technical && feedState.defender_technical) { dom.def_technical.textContent = feedState.defender_technical; dom.def_technical.style.display = ''; }
+    if (feedState.diff && !dom.diff_block) {
+      var endpoint = feedState.wire_request ? feedState.wire_request.url : '';
+      dom.diff_block = append(feed, makeDiffBlock(endpoint, feedState.diff));
+      scrollToBottom();
+    }
+    updateDivider(); renderNav();
+    return;
+  }
+
+  if (t === 'verified') {
+    feedState.stage = 'verified'; feedState.wire_blocked = p.exploit_blocked || false;
+    appState.iterations[feedState.iteration] = {stage: p.exploit_blocked ? 'verified' : 'breached'};
+    var last2 = appState.sandbox_history[appState.sandbox_history.length - 1];
+    if (last2) last2.status = p.exploit_blocked ? 'verified' : 'running';
+    if (!dom.wire_verify) { dom.wire_verify = append(feed, makeWireBlock(p.request, p.response, p.exploit_blocked)); }
+    updateDivider(); renderNav(); renderSidebar(); scrollToBottom();
+    return;
+  }
+}
+
+// ── SSE connection ─────────────────────────────────────────────────────────
+function connect() {
+  var es = new EventSource('/events/stream');
+  es.onmessage = function(e) {
+    try { handleEvent(JSON.parse(e.data)); } catch(err) {}
+  };
+  es.onerror = function() {
+    es.close();
+    setTimeout(connect, 3000);
+  };
+}
+
+connect();
+
+// ── control buttons ────────────────────────────────────────────────────────
+window.doRun = function() {
+  document.getElementById('btn-run').disabled = true;
+  fetch('/control/run', {method:'POST'})
+    .then(function() {
+      appState.running = true;
+      renderNav();
+    });
+};
+
+window.doAbort = function() {
+  fetch('/control/abort', {method:'POST'})
+    .then(function() {
+      appState.running = false;
+      renderNav();
+    });
+};
+
+// initial render
+renderNav();
+renderSidebar();
+
+})();
+</script>
+</body>
+</html>
