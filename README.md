@@ -1,6 +1,6 @@
 # Attack on Sandbox
 
-video demo: https://youtu.be/VJAmXWpQCRA
+video demo: [https://youtu.be/VJAmXWpQCRA](https://youtu.be/dJLpym5GxBE)
 
 NOTE: due to time constraints i was not able to edit the video or refine the streaming. the llm will output garbage at first but will then form words and sentences 
 
