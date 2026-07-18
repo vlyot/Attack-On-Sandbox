@@ -1,0 +1,4 @@
+daytona-sdk
+openai>=1.30.0
+python-dotenv
+requests>=2.31.0

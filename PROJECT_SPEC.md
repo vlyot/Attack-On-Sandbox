@@ -39,12 +39,12 @@ defends, and you watch the patch happen live."
 | LLM calling style | Manual JSON-in-prompt, parsed by the orchestrator — not native tool-calling |
 | Dashboard | Streamlit, all-Python, no separate frontend framework |
 | Repo | Single repo, three components: `target-app/`, `orchestrator/`, `dashboard/` |
-| Sponsor integrations | **Daytona + Kimi AI**, both load-bearing. Nosana: optional late stretch only (see §9) |
+| Sponsor integrations | **Daytona + ai& (deepseek-v4-flash)**, both load-bearing. Nosana: optional late stretch only (see §9) |
 | Name | Attack on Sandbox |
 
 **Still open / confirm day-of:**
-- Exact Kimi API details (endpoint, auth, model tier) — confirm at the workshop
-- Venue wifi reliability for Kimi + Daytona API calls — confirm morning-of, mobile hotspot as backup
+- Exact ai& API key and credit balance — confirm at the workshop
+- Venue wifi reliability for ai& + Daytona API calls — confirm morning-of, mobile hotspot as backup
 - Dashboard visual polish — timeboxed, cut first if behind schedule
 
 ---
@@ -57,7 +57,7 @@ attack-on-sandbox/
 │   ├── app.py                   #  note-taking API: seeded SQLi + IDOR + missing-auth bugs
 │   └── requirements.txt
 ├── orchestrator/                # the director — only place touching
-│   │                             #  Daytona SDK + Kimi API
+│   │                             #  Daytona SDK + ai& API
 │   ├── main.py                    #  fixed iteration sequence
 │   ├── daytona_client.py          #  create/upload/exec/get_url/delete wrapper
 │   ├── agents.py                  #  attacker_agent(), defender_agent(),
@@ -68,7 +68,7 @@ attack-on-sandbox/
 │   └── requirements.txt
 ├── events.json                  # shared state file (orchestrator writes,
 │                                  #  dashboard polls)
-├── .env                          # DAYTONA_API_KEY, KIMI_API_KEY
+├── .env                          # DAYTONA_API_KEY, AIAND_API_KEY
 └── README.md
 ```
 
@@ -165,32 +165,60 @@ was seeded, or rediscover an already-patched bug.
 
 ---
 
-## 6. LLM calling: manual JSON parsing
+## 6. LLM calling: JSON mode + real streaming
 
-Prompt the model in plain English to respond with *only* a JSON object in
-an exact specified shape; the orchestrator parses that text itself and
-performs the real action (HTTP request, file write). No native
-tool-calling / `tools` parameter used.
+Use `response_format: { "type": "json_object" }` on every agent call.
+The model is **guaranteed to return syntactically valid JSON** — no regex
+extraction, no code-fence stripping, no preamble handling needed. JSON mode
+and streaming compose freely: `response_format` only constrains the
+*final* assembled content to be valid JSON; `stream=True` just delivers
+that content incrementally as `delta.content` text fragments (OpenAI SSE
+shape, terminated by `[DONE]`). The orchestrator calls `json.loads()` on
+the fully assembled buffer once the stream ends — one real call per agent
+turn, not two.
 
 ```python
-import json, re
-
-def parse_model_json(raw_text: str) -> dict:
-    match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-    if not match:
-        raise ValueError(f"No JSON found in response: {raw_text}")
-    return json.loads(match.group())
+stream = client.chat.completions.create(
+    model="deepseek-ai/deepseek-v4-flash",
+    messages=[...],
+    response_format={"type": "json_object"},
+    stream=True,
+    stream_options={"include_usage": True},
+)
+buffer = []
+for chunk in stream:
+    if chunk.choices and chunk.choices[0].delta.content:
+        buffer.append(chunk.choices[0].delta.content)
+        # forward the raw delta live, before it's known to be valid JSON
+    if chunk.usage is not None:
+        usage = chunk.usage  # trailer chunk, present once per stream
+result = json.loads("".join(buffer))
 ```
 
-Wrap every model call in a retry (hard cap: 2 attempts): on parse failure,
-send a follow-up message telling the model its last response wasn't valid
-JSON and to respond with *only* the JSON object.
+**What the dashboard sees, in order:** raw SSE text deltas first (as
+`stream_chunk` events — proves a live token stream is happening, before the
+buffer is even parseable), then once the stream ends and `json.loads()`
+succeeds, the orchestrator replays the parsed `narration` field
+character-by-character via `narration_chunk` events exactly as before (this
+replay is a separate, deliberate pacing pass — 22ms/char — independent of
+the real network pacing of the raw stream). The dashboard's raw-stream view
+is replaced by the clean narration/wire-feed cards the instant the parse
+completes. There is no such thing as a "streamed structured field" — only a
+streamed raw JSON string, unparseable until complete.
+
+**Retry wrapper:** a single retry (hard cap: 1 re-attempt), needed only for
+network/5xx errors — not parse failures, which JSON mode makes impossible.
+
+**Token usage:** `stream_options={"include_usage": True}` delivers a usage
+object (prompt/completion/total tokens) on the stream's trailer chunk. The
+orchestrator writes this as an `llm_usage` event once per real call; the
+dashboard sums it into a running calls/tokens counter in the nav bar.
 
 ---
 
 ## 7. Dashboard — what it shows
 
-The dashboard is a presentation tool for the demo, not a control plane. The agents run headlessly and autonomously — no human interaction required. The data pipeline is simple: orchestrator writes newline-delimited JSON to `events.json`, dashboard polls and renders. Any other consumer of that stream (terminal tail, Slack bot, Grafana panel) would work identically — the Daytona sandbox just returns HTTP responses, the Kimi calls just return JSON. The dashboard exists to make what's happening legible to a live audience.
+The dashboard is a presentation tool for the demo, not a control plane. The agents run headlessly and autonomously — no human interaction required. The data pipeline is simple: orchestrator writes newline-delimited JSON to `events.json`, dashboard polls and renders. Any other consumer of that stream (terminal tail, Slack bot, Grafana panel) would work identically — the Daytona sandbox just returns HTTP responses, the ai& API calls just return JSON. The dashboard exists to make what's happening legible to a live audience.
 
 Four zones plus a live evidence tab, updating as the orchestrator writes to `events.json`
 (Streamlit polls the file on an interval — no websockets):
@@ -237,39 +265,75 @@ style.
 
 ## 8. Model & provider
 
-**Kimi AI API** — sponsor-provided credits, confirm exact endpoint/auth/
-model tier at the workshop before writing agent prompts aiteration it.
+**ai& API** (`https://api.aiand.com/v1`) — OpenAI-compatible drop-in,
+bearer token auth (`Authorization: Bearer sk-...`). Powers both the
+attacker and defender agents.
+
+**Selected model: `deepseek-ai/deepseek-v4-flash`**
+
+| Property | Value |
+|---|---|
+| Model ID | `deepseek-ai/deepseek-v4-flash` |
+| Context window | 1M tokens |
+| Input pricing | $0.15 / 1M tokens |
+| Output pricing | $0.25 / 1M tokens |
+| Capabilities | reasoning, tool_calling |
+
+**Why `deepseek-v4-flash`:**
+Best cost/performance ratio for this project's actual needs. Both agents
+reason about Flask source code and must return clean, structured JSON
+reliably — DeepSeek V4 (same generation as V3/R1) has strong, documented
+code and JSON reliability. The 1M context window means the full source code
+fits with no truncation risk across all iterations. At ~6 real agent calls
+total for the demo, the entire token spend is under $0.01 — credit
+discipline is a non-issue at this price point.
+
+**Why not the other options:**
+- `qwen/qwen3.6-27b` is free but free-tier models carry real risk of rate
+  limiting, queue delays, or reliability gaps on the day. Not worth it for
+  a live demo with a hard 2-minute window.
+- `deepseek-v4-pro` is 6× the cost ($1.00/$2.50) for no meaningful gain at
+  this task scale.
+- Kimi/Moonshot models ($0.75–$0.85 input, $3.50 output) are 5–14× more expensive
+  with a smaller context window and no code-specific advantage over V4-flash.
+
+**Integration:**
+- **Base URL:** `https://api.aiand.com/v1`
+- **Auth:** `Authorization: Bearer $AIAND_API_KEY`
+- **SDK:** standard OpenAI Python client with `base_url` override
+- **Streaming:** SSE via `stream=True`, chunks at `choices[0].delta.content`.
+  Add `stream_options={"include_usage": True}` to get token counts for the
+  status panel without a separate call.
+- **Model string:** `"deepseek-ai/deepseek-v4-flash"`
 
 **Reliability test (do this first, before building anything else):** write
 the smallest possible script — one prompt asking for a fixed JSON shape,
-run it 5–10 times against the actual Kimi model, confirm it reliably
-returns clean, parseable JSON.
+run it 5–10 times, confirm it reliably returns clean, parseable JSON.
 
-**If Kimi proves unreliable under test:** fall back to Groq free tier
-(`openai/gpt-oss-120b`, confirm live at `console.groq.com/docs/models` —
-catalog has been volatile in 2026) — but this changes the sponsor-usage
-story, so only fall back if genuinely necessary.
+**If `deepseek-v4-flash` proves unreliable under test:** step up to
+`deepseek-ai/deepseek-v4-pro` on the same endpoint — same base URL, one
+model string change, no other code changes.
 
 ---
 
 ## 9. Sponsor integration plan
 
-**Committed: Daytona + Kimi AI, both load-bearing.** Daytona hosts and
-isolates the target app (core to the architecture); Kimi's API powers both
-the attacker and defender agents (core to the loop).
+**Committed: Daytona + ai& (DeepSeek V4-flash), both load-bearing.** Daytona
+hosts and isolates the target app (core to the architecture); ai&'s API
+serving `deepseek-ai/deepseek-v4-flash` powers both the attacker and
+defender agents (core to the loop).
 
 **Nosana: optional late-stage stretch only.** Not part of the core build —
 only attempt after the core loop (§12 steps 1–7) is rock solid and
 demo-ready. If time allows, a minimal add-on: run a second,
 independently-hosted model on Nosana as a sanity-check validator for the
-defender's patch. Do not architect the core system aiteration this.
+defender's patch. Do not architect the core system around this.
 
-**Note on "Kimi on Daytona":** means calling Kimi's hosted API from code
-running in the orchestrator/sandbox — not self-hosting Kimi's weights
-inside a Daytona sandbox. Kimi K2 is a ~1T-parameter model requiring
-multi-GPU clusters (8×H100/H200-class); a Daytona sandbox is a small
-isolated Linux box and cannot run the actual weights. Confirmed infeasible
-for a one-day build.
+**Note on model hosting:** `deepseek-ai/deepseek-v4-flash` runs on ai&'s
+infrastructure — the orchestrator calls `https://api.aiand.com/v1` from
+your local machine. The Daytona sandbox hosts only the vulnerable Flask
+target app. The two are separate: ai& serves the model, Daytona serves the
+attack surface.
 
 ---
 
@@ -279,7 +343,7 @@ for a one-day build.
 |---|---|
 | Agent wanders / takes too many turns under time pressure | Extremely directive prompts ("act, do not ask questions, do not explain"); hard cap on max turns in code |
 | Model doesn't reliably return clean JSON | Defensive regex + retry wrapper (max 2 attempts); reliability test before building; Groq fallback chosen in advance |
-| Daytona/Kimi network flakiness live on stage | **Record a successful full rehearsal run as video backup**; play it if live infra fails |
+| Daytona/ai& network flakiness live on stage | **Record a successful full rehearsal run as video backup**; play it if live infra fails |
 | Venue wifi issues | Confirm morning-of; mobile hotspot as backup |
 | Streamlit polling causes visual stutter | Test early; increase poll interval or use `st.empty()` placeholders correctly if distracting |
 | Scope too large for the time available | Dashboard polish is the first thing to cut; Iteration 3 is the second; the two-iteration core loop is not cuttable |
@@ -290,11 +354,11 @@ for a one-day build.
 
 ## 11. Credit discipline (read before running any real API/sandbox calls)
 
-Kimi API calls and Daytona sandbox operations spend finite, sponsor-provided
+ai& API calls and Daytona sandbox operations spend finite, sponsor-provided
 credits for the day — not unlimited free infra. A previous hackathon burned
 through limited credits via uncontrolled iteration; do not repeat that.
 
-- **Do not loop, batch-test, or repeatedly re-run scripts that call Kimi or
+- **Do not loop, batch-test, or repeatedly re-run scripts that call ai& or
   create/tear down Daytona sandboxes as a debugging strategy.**
 - **Test logic with mocks/stubs first.** Debug the orchestrator's control
   flow, JSON parsing, event-writing, and dashboard rendering against fake/
@@ -322,7 +386,7 @@ through limited credits via uncontrolled iteration; do not repeat that.
    exploitable via curl. No Daytona involved yet.
 3. `orchestrator/daytona_client.py` — sandbox create/upload/exec/get URL/
    delete, tested manually against the target app.
-4. Kimi reliability test (§8) — confirm before writing agent prompts aiteration it.
+4. ai& / deepseek-v4-flash reliability test (§8) — confirm before writing agent prompts.
 5. `orchestrator/agents.py` — attacker/defender prompt functions + JSON
    parsing/retry.
 6. `orchestrator/main.py` + `events.py` — the fixed iteration sequence.
@@ -465,7 +529,7 @@ add stray text).
 
 The hackathon's stated requirement is to "integrate sponsors' products,"
 not explicitly all three by name. Two genuinely load-bearing integrations
-(Daytona for infra, Kimi for both agents) should score better on the
+(Daytona for infra, ai& / deepseek-v4-flash for both agents) should score better on the
 "Sponsored Product Usage" criterion than three shallow, forced ones — a
 judge is likely to notice a token integration bolted on to chase a
 checkbox. Nosana remains a clean, honest option to add if time allows, but

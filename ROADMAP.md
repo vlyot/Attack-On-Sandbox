@@ -8,7 +8,7 @@ Two processes running simultaneously on one machine at demo time:
 Runs the full adversarial loop autonomously with zero human input after launch:
 - Iteration 1: Attacker agent receives the target app URL and a scoped prompt ("look for SQL injection only"). It reasons about the app, constructs a payload, and returns a JSON object describing an HTTP request. The orchestrator fires that request for real, captures the real response, writes an `attack_sent` event, and passes the request/response pair + current source to the defender. Defender returns a JSON object with the full patched file contents. Orchestrator writes the patch, redeploys into the Daytona sandbox, restarts the service, then replays the exact original exploit request. The re-verification result is written as a `verified` event.
 - Iteration 2: Same loop, scoped to IDOR/broken auth.
-- All HTTP traffic is real. All Kimi API calls are real. The sandbox is torn down and respun between iterations.
+- All HTTP traffic is real. All ai& API calls are real. The sandbox is torn down and respun between iterations.
 
 **Process 2 — Dashboard** (`streamlit run dashboard/app.py`)
 Polls `events.json` on an interval and renders four zones live:
@@ -17,7 +17,7 @@ Polls `events.json` on an interval and renders four zones live:
 - Wire feed showing the actual HTTP request and raw response, styled red for breaches, green for blocked attempts
 - Agent reasoning panel showing short-form summaries of what each agent decided and why
 
-**Backup:** a recorded video of a complete clean run exists before the live demo. If Daytona or Kimi goes down on stage, the video plays instead.
+**Backup:** a recorded video of a complete clean run exists before the live demo. If Daytona or ai& goes down on stage, the video plays instead.
 
 The full demo loop takes approximately 2 minutes end-to-end.
 
@@ -77,44 +77,65 @@ Before moving to Phase 3A, manually confirm:
 
 ---
 
-## Phase 2A — Event System
+## Phase 2A — Event System ✅ COMPLETE
 
-**Touches:** `orchestrator/events.py`, `events.json` (fixture file)
+**Touches:** `orchestrator/__init__.py`, `orchestrator/events.py`, `orchestrator/make_fixture.py`, `events.json`
 **Depends on:** nothing
 **Unlocks:** Phase 2B, Phase 3B
 
 ### Goal
 Define the single shared data contract that connects the orchestrator to the dashboard. Every observable state change in the system is represented as a structured event appended to `events.json`. Getting this schema right early prevents rework in both the orchestrator and dashboard later.
 
+### Implementation
+
+**`orchestrator/events.py`** — the sole event-writing interface. All orchestrator code imports from here; nothing else writes to `events.json` directly.
+
+Public API:
+- `write_event(event: dict, path: str = "events.json") -> None` — appends one JSON line; opens in `"a"` mode
+- `make_sandbox_ready(sandbox_id, url, region, created_at, cpu, memory, iteration, vulnerability_class) -> dict`
+- `make_sandbox_destroyed(sandbox_id, iteration, vulnerability_class) -> dict`
+- `make_iteration_start(iteration, vulnerability_class) -> dict`
+- `make_agent_thinking(agent, label, iteration, vulnerability_class) -> dict` — `agent`: `"attacker"|"defender"`; `label`: static string
+- `make_narration_chunk(agent, char, iteration, vulnerability_class) -> dict` — validates `len(char) == 1`
+- `make_attack_sent(request, response, agent_reasoning, iteration, vulnerability_class) -> dict`
+- `make_patch_applied(diff, patched_source, agent_reasoning, iteration, vulnerability_class) -> dict`
+- `make_verified(request, response, exploit_blocked, iteration, vulnerability_class) -> dict` — validates `isinstance(exploit_blocked, bool)`
+- `make_iteration_complete(iteration, vulnerability_class) -> dict`
+
+Internal helper `_base(type_, iteration, vulnerability_class)` stamps every event with `{type, timestamp, iteration, vulnerability_class}` using UTC ISO 8601 + `Z` suffix.
+
 ### Event schema
 Each event is one JSON object per line (newline-delimited JSON), with at minimum:
-- `type` — one of: `sandbox_ready`, `iteration_start`, `agent_thinking`, `narration_chunk`, `attack_sent`, `patch_applied`, `verified`, `iteration_complete`
-- `timestamp` — ISO 8601
+- `type` — one of: `sandbox_ready`, `sandbox_destroyed`, `iteration_start`, `agent_thinking`, `narration_chunk`, `attack_sent`, `patch_applied`, `verified`, `iteration_complete`
+- `timestamp` — ISO 8601 UTC, e.g. `"2026-07-18T14:32:01.123Z"`
 - `iteration` — integer (1, 2, or 3)
 - `vulnerability_class` — `"sqli"`, `"idor"`, or `"missing_auth"`
 - `payload` — object whose shape varies by event type (see below)
 
 Event-specific payload shapes:
-- `sandbox_ready`: `{ sandbox_id: string, url: string, region: string, created_at: string, spec: {cpu, memory} }` — written by `setup.py` once the Flask health check responds. Dashboard displays live URL and metadata in the status panel. On subsequent iterations (redeploy), a new `sandbox_ready` event is written with the same sandbox ID but a fresh `created_at` timestamp.
-- `sandbox_destroyed`: `{ sandbox_id: string, iteration: int, vulnerability_class: string }` — written when the sandbox is torn down (end of run or between full resets). Dashboard moves this entry to the sandbox history log.
-- `narration_chunk`: `{ agent: "attacker" | "defender", char: string }` — one event per character of the narration field, written as tokens stream in. Dashboard appends each char to the active pending card for the typewriter effect. Replaced by the full `attack_sent` or `patch_applied` event on completion.
-- `agent_thinking`: `{ agent: "attacker" | "defender", label: string }` — written synchronously by the orchestrator immediately before the streaming Kimi call begins. No model output. `label` is a static string: `"Scanning for vulnerabilities..."` or `"Analysing the breach..."`. Cost: zero extra API calls.
-- `attack_sent`: `{ request: {method, url, headers, body}, response: {status, body}, agent_reasoning: {narration: string, technical: string} }`
-- `patch_applied`: `{ diff: string, patched_source: string, agent_reasoning: {narration: string, technical: string} }` — diff computed by the orchestrator via `difflib`, not taken from the model
-- `verified`: `{ request: {…}, response: {…}, exploit_blocked: boolean }`
+- `sandbox_ready`: `{ sandbox_id, url, region, created_at, spec: {cpu, memory} }` — written by `setup.py` once Flask health check responds
+- `sandbox_destroyed`: `{ sandbox_id }` — written at end of iteration; dashboard moves to history log
+- `narration_chunk`: `{ agent, char }` — one event per character; dashboard appends for typewriter effect
+- `agent_thinking`: `{ agent, label }` — written before each AI call; zero API cost
+- `attack_sent`: `{ request: {method, url, headers, body}, response: {status, body}, agent_reasoning: {narration, technical} }`
+- `patch_applied`: `{ diff, patched_source, agent_reasoning: {narration, technical} }` — diff computed by orchestrator via `difflib`
+- `verified`: `{ request, response, exploit_blocked: boolean }`
 
-**`agent_reasoning` is always a two-field object, never a plain string:**
-- `narration` — terse, first-person present-tense inner monologue written by the model, prompted into a dramatic voice. Attacker is clinical and predatory; defender is methodical. This is what the audience reads on the big panel.
-- `technical` — the model's actual reasoning about vulnerability class, payload choice, and patch rationale. Displayed in a smaller monospace block beneath the narration for judges who want depth.
-
-Both fields are returned verbatim from the model — no post-processing by the orchestrator. The prompt instructs the model to write `narration` in this specific style as part of the JSON shape it returns.
+**`agent_reasoning` is always `{narration, technical}`, never a plain string.**
 
 ### Fixture file
-Hand-craft a complete `events.json` covering all three iterations in sequence — including `agent_thinking` events immediately before each `attack_sent` and `patch_applied`, so the dashboard's pending state and replacement behaviour can be developed and tested against the fixture before the real orchestrator exists. Payloads should be realistic-looking (but fake) and include both `narration` and `technical` subfields on all agent reasoning events.
+**`orchestrator/make_fixture.py`** — generates `events.json` by calling the actual event constructors (not hand-typed JSON), guaranteeing schema consistency. Run with `python orchestrator/make_fixture.py`.
+
+Fixture covers all three iterations in sequence:
+1. SQLi — `sbox-c7d2e1` / `https://c7d2e1.daytona.io`
+2. IDOR — `sbox-a3f9c2` / `https://a3f9c2.daytona.io`
+3. Missing auth (stretch) — `sbox-b1d8f4` / `https://b1d8f4.daytona.io`
+
+613 events total: 586 `narration_chunk`, 6 `agent_thinking`, 3 each of the remaining types. All sandbox URLs use fake `https://<id>.daytona.io` format (not localhost). Fixture is gitignored — regenerate anytime with `make_fixture.py`.
 
 ---
 
-## Phase 2B — Dashboard
+## Phase 2B — Dashboard ✅ COMPLETE
 
 **Touches:** `dashboard/app.py`, `dashboard/requirements.txt`
 **Depends on:** Phase 2A fixture
@@ -134,8 +155,8 @@ A standalone HTML prototype exists (`Attack on Sandbox Dashboard - Standalone Cl
 - **Status panel (always-visible sidebar or bottom bar):** two columns, pinned — never scrolls with the feed. Updated live from `sandbox_ready`, `sandbox_destroyed`, and streaming token events.
 
   ```
-  DAYTONA SANDBOX                    KIMI
-  ID:      sbox-c7d2e1               Model:   kimi-k2.6
+  DAYTONA SANDBOX                    AI& (deepseek-v4-flash)
+  ID:      sbox-c7d2e1               Model:   deepseek-v4-flash
   URL:     https://c7d2e1.daytona.io Calls:   3
   Region:  us-east-1                 Tokens:  ~1,240
   Status:  ● RUNNING                 Latency: 8.3s avg
@@ -152,10 +173,10 @@ A standalone HTML prototype exists (`Attack on Sandbox Dashboard - Standalone Cl
   - `Status` — `● RUNNING` (green) / `● RESTARTING` (amber, during patch redeploy) — derived from orchestrator events
   - `Created` — timestamp from `sandbox_ready`
 
-  Kimi column fields (tracked by orchestrator, written to events):
-  - `Model` — model name from API response
-  - `Calls` — running count of Kimi API calls made this session
-  - `Tokens` — cumulative token count from `usage` field in streaming response
+  ai& column fields (tracked by orchestrator, written to events):
+  - `Model` — `deepseek-v4-flash` (static; pulled from config)
+  - `Calls` — running count of ai& API calls made this session
+  - `Tokens` — cumulative token count from `usage` field in streaming response (available via `stream_options={"include_usage": True}`)
   - `Latency` — rolling average time from `agent_thinking` to corresponding `attack_sent`/`patch_applied`
 
   Previous sandboxes log: populated from `sandbox_destroyed` events. Shows ID, which iteration it served, vulnerability class, and destruction timestamp. Proves sandboxes are being created and torn down, not one persistent server.
@@ -166,7 +187,7 @@ A standalone HTML prototype exists (`Attack on Sandbox Dashboard - Standalone Cl
   - When an `agent_thinking` event arrives: render an animated pending card with the `label` field and a pulsing indicator. This card is replaced — not appended — when the corresponding `attack_sent` or `patch_applied` event arrives.
   - `narration` text large and readable — this is what the audience watches. The two voices are deliberately asymmetric: the attacker's narration is certain and clinical (it knew what it was doing); the defender's narration is investigative, building from the evidence (it had to figure it out). This asymmetry is the dramatic core of the demo.
   - `technical` text below in a small `st.code()` monospace block — for judges who want the full reasoning trail
-  - **Attacker taunt:** a short pre-scripted one-liner rendered as a distinct visual beat between the breach wire feed and the defender card (dashed left border, italic). This is authored by you, not generated by Kimi — it is pure theatre. The defender never sees it; it receives only request + response + source. Examples: *"Thanks for the login — didn't even need a password."*, *"Appreciate Annie's notes — didn't need to be her to read them."*, *"Reset's done — nobody even asked who I was."*
+  - **Attacker taunt:** a short pre-scripted one-liner rendered as a distinct visual beat between the breach wire feed and the defender card (dashed left border, italic). This is authored by you, not generated by the model — it is pure theatre. The defender never sees it; it receives only request + response + source. Examples: *"Thanks for the login — didn't even need a password."*, *"Appreciate Annie's notes — didn't need to be her to read them."*, *"Reset's done — nobody even asked who I was."*
 - **Polling:** use `st.rerun()` on a short interval (e.g. 2 seconds). Avoid re-reading the whole file unnecessarily — track the last event count and only process new lines.
 
 ### Proving the sandbox is real (critical for demo credibility)
@@ -193,7 +214,76 @@ Displayed as a before/after side-by-side panel with timestamps. No human input r
 ### Dashboard is a window, not a control plane
 The dashboard is purely a visual layer for the demo — the agents run headlessly and autonomously with no human in the loop. The data pipeline is simple: the orchestrator writes newline-delimited JSON events to `events.json`, the dashboard polls and renders.
 
-Any other consumer of that file would work equally well: a terminal tail, a Slack bot, a Grafana panel, a custom web UI. The dashboard is not the product — it is a presentation tool for the judges. Anyone watching the demo could swap it for their own consumer by simply reading `events.json` and reacting to events however they prefer. The Daytona sandbox just returns HTTP responses; the Kimi calls just return JSON. The orchestrator is the only thing that matters architecturally.
+Any other consumer of that file would work equally well: a terminal tail, a Slack bot, a Grafana panel, a custom web UI. The dashboard is not the product — it is a presentation tool for the judges. Anyone watching the demo could swap it for their own consumer by simply reading `events.json` and reacting to events however they prefer. The Daytona sandbox just returns HTTP responses; the ai& API calls just return JSON. The orchestrator is the only thing that matters architecturally.
+
+### Implementation (actual — July 2026)
+
+**`dashboard/app.py`** — single-file Streamlit app (~290 lines).
+
+Architecture: `read_new_events()` seeks to a byte cursor in `events.json`, reads new NDJSON lines, updates the cursor. `apply_event()` dispatches each event to `st.session_state` via a `match` block. `main()` polls at 80ms idle interval via `st.rerun()`, processes up to 50 events per cycle to stay responsive.
+
+Key implementation decisions vs. spec:
+- **Typewriter via cursor:** `narration_chunk` events are accumulated into `attacker_narration`/`defender_narration` strings in session state. Each `st.rerun()` replays the growing string — no `time.sleep` inside the render path.
+- **Mutable default fix:** `init_state()` calls `.copy()` on list/dict defaults so each session gets a fresh object, preventing cross-run state leakage.
+- **Strict-mode Playwright fix:** `st.tabs()` renders duplicate DOM elements; e2e tests use `.first` locators.
+- **Live Evidence probes:** fired synchronously inside `render_live_evidence_tab()` when `_probe_before`/`_probe_after` flags are set by `apply_event()`. 5s timeout, never raises.
+- **CSS:** injected via `st.html(_CSS)`, called unconditionally on every rerun (see "CSS injection fix" below for why the earlier once-per-session guard was removed).
+
+**`dashboard/requirements.txt`**: `streamlit>=1.35.0`, `requests>=2.31.0`, `pygments>=2.17.0`
+
+Verified:
+- 18/18 unit tests pass (state dispatch, cursor advancement, probe error handling, full fixture replay → 3 history entries, final stage "verified")
+- 12/12 Playwright e2e tests pass against live Streamlit server (page load, tab switching, event replay rendering)
+
+### Visual remediation (actual — July 2026)
+
+The HTML prototype (`Attack on Sandbox Dashboard - Standalone Claude Design.html`) is a self-executing Claude Artifact bundle — its real markup/CSS/JS is encoded inside `<script type="__bundler/template">`, not visible as plain HTML at a glance. Decoding it (extract the JSON string from that script tag) revealed a deliberate design system — warm parchment palette (`#f3f2f2` bg / `#201f1d` text / `#b68235` amber accent), Cormorant Garamond + Lora serif typography, a dark charcoal feed panel with typewriter-caret narration and staggered diff reveals — that had not made it into the initial Streamlit build, which shipped with generic default styling instead. This subsection documents the restyle that closed that gap, keeping the working polling/event architecture in place and only replacing the CSS/layout.
+
+**Kept unchanged:** `read_new_events()`, `apply_event()`'s dispatch logic and `st.session_state` schema, `fire_live_probe()`, the underlying event contract from `orchestrator/events.py`.
+
+**Changed:**
+- **`_CSS`** — rewritten with the prototype's design tokens (`--color-bg`, `--color-accent`, etc.), a Google Fonts `@import` for Cormorant Garamond/Lora (simpler than self-hosting `woff2` files, since the prototype's self-hosting exists for artifact portability which doesn't apply here), and three of the prototype's four `@keyframes` (`livePulse`, `caretBlink`, `feedIn` — `typeClip` was skipped since the diff view stays Streamlit's native `st.code(diff, language="diff")`, which already has adequate red/green line coloring and can't easily host a per-character clip-path reveal). Semantic red/green (`#e53935`/`#43a047`) were kept as-is rather than swapped for the prototype's OKLCH figures — no functional gap existed there.
+- **Layout** — replaced the `st.columns([2,2,2])` three-way split (code / wire / agent) with a single vertical feed (`render_feed()`), matching the prototype's one continuous scrollable panel: narration → wire (breach) → taunt → narration → diff → wire (verified), in event order. `render_status_bar()` was split into `render_nav_bar()` (brand, tagline, sandbox/model tag pills, Reset button) and `render_round_gallery()` (3 iteration cards — numeral + stage badge only, deliberately **not** the endpoint name, per the existing discovery-framing rule above; the prototype shows the endpoint upfront but that's a deviation kept intentional here).
+- **Taunt lines** — previously absent from the dashboard entirely (the pre-scripted one-liners from the spec above existed only as prose in this document). Now rendered as `TAUNTS` dict + `_taunt_for(vuln_class)` + `_feed_taunt_block()`, appearing as a dashed-red-border italic line between the breach wire block and the defender's narration, exactly as originally specified.
+- **New: Reset button** (`do_reset()` / `render_reset_button()`) — clears `events.json`, restores `target-app/app.py` via `git checkout`, deletes `target-app/notes.db`, and resets `st.session_state` back to defaults, so a demo run can be repeated without a manual terminal cleanup. File-level only — cannot stop a separately-running `orchestrator/main.py` process or its target-app subprocess, so the button is disabled unless `stage` is `idle` or `verified` (guards against resetting files out from under an in-flight run) and its help text tells the presenter to stop the orchestrator first.
+- **Typewriter pacing** — `narration_chunk` events were previously processed up to `MAX_EVENTS_PER_CYCLE` (50) per rerun with no delay, so text visually jumped in large blocks rather than animating. `_process_events_this_cycle()` now caps narration_chunk processing at `MAX_NARRATION_CHARS_PER_CYCLE = 15` per cycle with a small `NARRATION_CHAR_DELAY_S` (10ms) sleep between chars, so the reveal is visible on screen across the run without duplicating the orchestrator's own 22ms/char pacing on the render side. A blinking `▌` caret (`aos-caret`, using the prototype's `caretBlink` keyframe) is appended to a narration card's quote while that agent's narration is still incomplete.
+- **Branding fix** — the nav bar previously would have inherited the prototype's stale "Kimi K2 agents" tag (the project moved to ai&/deepseek-v4-flash before the dashboard was built, so this was never actually shipped, but is called out here since it's a trap for anyone copying the prototype's markup directly). `MODEL_TAG = "ai& · deepseek-v4-flash"` is now the canonical tag text.
+
+**New file:** `dashboard/__init__.py` (empty) — added so `dashboard` is an importable package, matching `orchestrator/__init__.py`'s existing pattern; required for `dashboard/test_dashboard.py` to `from dashboard import app`.
+
+Verified:
+- 20/20 unit tests pass (`dashboard/test_dashboard.py`) — pure HTML-builder functions (`_taunt_for`, `_feed_narration_block`, `_feed_wire_block`, `_feed_taunt_block`, `_feed_divider`) tested directly with no Streamlit context; `do_reset()`/`render_reset_button()`/`apply_event()` regression tests run through Streamlit's `AppTest.from_string()` harness (a real `st.session_state` without invoking `main()`'s infinite polling loop, which `AppTest` can't drive directly since it never returns)
+- Full repo suite (`orchestrator/` + `dashboard/`): 54/54 pass
+- Live end-to-end: ran `python orchestrator/main.py` against the local target app (real 3-iteration run, `MOCK = True`), then drove `dashboard/app.py`'s render functions against the resulting real `events.json` via `AppTest` — zero exceptions, taunt lines confirmed present at the correct point in the timeline (e.g. "Thanks for the login…" visible immediately after iteration 1's `verified` event), "Breach confirmed" correctly shown mid-flight (right after `attack_sent`, before the patch lands) and replaced by "Exploit blocked — patch holds" once verified
+- Also ran a real `streamlit run` server against the live `events.json` for several minutes with no exceptions in the server log
+- **Gap (resolved — see "CSS injection fix" below):** Playwright MCP was not attached in this session (checked via ToolSearch — same limitation noted in the Phase 4 session); a real rendered-DOM/visual screenshot check was not possible at the time. `AppTest`-based verification (above) was a reasonable substitute for confirming render correctness and absence of exceptions, but did not confirm actual visual appearance (font loading, color rendering, animation smoothness) in a real browser — and in fact missed a real bug that only a live browser check could catch (below).
+
+### CSS injection fix (July 2026)
+
+A later live-browser check (once Playwright MCP was attached) found that the dashboard was actually rendering as **plain unstyled text** — no dark panel, no fonts, no badges — contradicting the clean `AppTest` result above. Root cause: `inject_css()` called `st.markdown(_CSS, unsafe_allow_html=True)` only once per session, gated behind `if "_css_injected" not in st.session_state`. `AppTest` never caught this because it only exercises a single script pass per test; it never exercises the dashboard's actual behavior of rerunning itself repeatedly via `st.rerun()` in its polling loop (`main()`, `POLL_INTERVAL_S = 0.08`). Under real repeated reruns, Streamlit's frontend element-tree reconciliation was dropping the once-emitted `<style>` markdown node — confirmed live via Playwright (`document.querySelectorAll('style')` showed the tag missing entirely from the DOM, not merely present-but-uncascaded).
+
+**Fix:** `inject_css()` now calls `st.html(_CSS)` unconditionally on every rerun (no session-state guard). `st.html()` inserts as a true top-level DOM node rather than a scoped markdown fragment, and calling it every rerun means it can never be reconciled away. The same `st.markdown(..., unsafe_allow_html=True)` → `st.html(...)` swap was applied to every other purely-styling/structural HTML call in the file (`render_nav_bar`, `render_round_gallery`, `render_feed`, `render_history`, the inline HTTP-status spans in `render_live_evidence_tab`) for consistency, though only the CSS injection itself was actually broken by the once-per-session guard — the others were already re-emitted every rerun and rendered correctly before this fix too.
+
+**Also investigated (no code change needed):** the same session separately reported old iteration state appearing to linger after clicking "Reset & Run" mid-run. Live Playwright testing across several repeated Reset & Run cycles found `do_reset()` (clears `events.json`, restores `target-app/app.py`, deletes `notes.db`, resets every `st.session_state` key including `history`) works correctly — `history` was observed growing correctly from empty on every fresh run, with no persisted stale entries. One single `browser_evaluate` read caught a transient 3-stale-entries reading that did not reproduce in any subsequent snapshot or screenshot; this is consistent with Streamlit patching `render_feed()`'s and `render_history()`'s DOM updates in separate frontend messages a few milliseconds apart during a rerun, not a `session_state` correctness bug. No fix was made here since nothing reproducible was found — if a future session reproduces a persistent (non-transient) version of this, capture a screenshot (not just one `evaluate()` read) to confirm before investigating further.
+
+Verified (this fix):
+- 68/68 tests pass (`orchestrator/` + `dashboard/` combined; `pytest -q` from repo root)
+- Live Playwright verification against a real `streamlit run dashboard/app.py` server: confirmed `<style>` tag containing `_CSS` (searched for the `"Cormorant"` substring) present in the live DOM both on first load and after 300+ polling reruns mid-run; `getComputedStyle()` on `.aos-brand`/`.aos-feed` resolved to the custom fonts and dark panel background (`rgb(30, 30, 46)`), not Streamlit defaults; zero browser console errors/warnings
+- Ran a full live 3-iteration demo end-to-end via the dashboard's own "Reset & Run" button (mock orchestrator, `MOCK = True`) and visually confirmed the dark panel, colored role badges, "Breach confirmed"/"Exploit blocked — patch holds" wire coloring, and diff add/del coloring all render correctly throughout
+- Test/dev artifacts (screenshots, `.playwright-mcp/` snapshots, `events.json`, `notes.db`) cleaned up after verification; `target-app/app.py` restored to its committed vulnerable baseline via `git checkout`
+
+### Running feed across all 3 iterations (July 2026)
+
+Requested change: the feed previously showed only the *current* iteration's narration/wire/diff blocks, replacing them wholesale on the next `iteration_start`; a separate `render_history()` call below it only kept a one-line divider summary per completed iteration ("Iteration N complete — X"), discarding the full rendered content once an iteration ended. The ask was to keep every iteration's full content visible and stacked, clearing only on an explicit reset.
+
+**Fix:** extracted the existing per-iteration block-building logic out of `render_feed()` into `_current_iteration_blocks()` (unchanged rendering logic — divider → attacker narration → wire → taunt → defender narration → diff → wire verified). At `iteration_complete`, `apply_event()` now calls `st.session_state.history.extend(_current_iteration_blocks())`, freezing that iteration's fully-rendered HTML blocks into `history` before the next `iteration_start` clears the live fields. `history` changed from a list of small summary dicts to a flat list of already-rendered HTML block strings. `render_feed()` now renders `list(st.session_state.history) + _current_iteration_blocks()` as one continuous `.aos-feed` — every completed iteration's full content, followed by the in-progress iteration's live content — so `render_history()` (the old one-line-per-iteration summary) became redundant and was removed along with its call site in `main()`.
+
+**Bug caught during live verification, fixed same session:** the very last iteration of a run has no subsequent `iteration_start` to clear its live fields, so `_current_iteration_blocks()` kept re-rendering that iteration's content as "live" even after `iteration_complete` had already frozen the same blocks into `history` — producing a visible duplicate of the final iteration's divider and content. Fixed by adding a `_iteration_frozen` session-state flag: set `True` in `iteration_complete` right after the `history.extend(...)` snapshot, checked (and short-circuited on) at the top of `_current_iteration_blocks()`, and reset to `False` at the top of the next `iteration_start`. `do_reset()` clears it along with every other `_STATE_DEFAULTS` key.
+
+Verified:
+- 68/68 tests pass. `test_apply_event_full_iteration_reaches_verified_stage` (`dashboard/test_dashboard.py`) updated — it previously asserted `len(history) == 1` (one summary dict per completed iteration); now asserts the joined HTML in `history` contains the iteration's "complete" divider text and its defender narration, matching the new list-of-rendered-blocks representation.
+- Live Playwright verification against a real `streamlit run` server across two full Reset & Run cycles: confirmed exactly 3 `.aos-divider-label` elements and 3 `.aos-diff` blocks after a completed 3-iteration run (no duplicate final-iteration render), all three iterations' full narration/wire/taunt/diff content simultaneously present in the DOM in order, and the feed fully clearing to just the new run's fresh content immediately after clicking "Reset & Run" a second time mid-demo.
+- Test/dev artifacts cleaned up and `target-app/app.py` restored to baseline after verification, as before.
 
 ### Animation reference (from HTML prototype)
 The prototype uses these patterns — replicate in Streamlit where possible:
@@ -203,6 +293,8 @@ The prototype uses these patterns — replicate in Streamlit where possible:
 - Pulsing live indicator dot while events are actively arriving
 - Auto-scroll feed to latest event
 
+**Deferred (not implemented):** the prototype's play/pause/step-back/step-forward transport controls and progress-dot scrubber. These exist in the prototype because it has no live backend — scrubbing through a fixed 18-event script is its only way to demo itself. The real dashboard tails a live, indefinite event stream instead, so this affordance isn't needed for the hackathon demo. If the dashboard is ever reused as a standalone teaching/portfolio piece (i.e. replayed against a saved `events.json` after the fact rather than live), a scrubber would be the natural next addition — `st.session_state` would need to retain the full ordered event log (not just derived current-state fields) to support seeking to an arbitrary point in the past.
+
 ### Polish (cuttable if time runs out)
 - Typewriter animation on narration text
 - Auto-scroll the wire feed and reasoning panel to the latest event
@@ -210,16 +302,33 @@ The prototype uses these patterns — replicate in Streamlit where possible:
 
 ---
 
-## Phase 3A — Daytona Client
+## Phase 3A — Daytona Client ✅ COMPLETE
 
-**Touches:** `orchestrator/daytona_client.py`
+**Touches:** `orchestrator/daytona_client.py`, `orchestrator/load_daytona_env.py`, `orchestrator/requirements.txt`
 **Depends on:** Phase 1 (target app must exist to deploy and test)
 **Unlocks:** Phase 4
+
+### Implementation notes
+- SDK: `daytona-sdk==0.199.0` (PyPI package `daytona-sdk`, import `daytona_sdk`)
+- Auth: JWT token + org ID from `~/.../daytona/config.json` — loaded by `load_daytona_env.inject_env()` into `DAYTONA_JWT_TOKEN` / `DAYTONA_ORGANIZATION_ID` before client init
+- Sandboxes are created with `public=True` so preview URLs are accessible without Auth0 redirect
+- Flask is launched via the session API with `run_async=True` (`SessionExecuteRequest`) to avoid the server-side command timeout that would fire on a long-running foreground process
+- pip install is run as a separate synchronous exec with `timeout=300` (cold sandbox takes ~2 min); Flask start uses the session API
+- SSL verification disabled for health checks only — `daytonaproxy01.net` wildcard cert doesn't chain on Windows Python by default
+- Preview URL format: `https://5000-{sandbox_id}.daytonaproxy01.net`
+
+### Verified (2026-07-18)
+5/5 integration tests passed against a real Daytona sandbox:
+1. Sandbox created, URL is a reachable https domain ✓
+2. Flask app responds on root health endpoint ✓
+3. SQLi payload returns 200 + token against live sandbox ✓
+4. Patched file replaces running app after restart ✓ (SQLi blocked → 401)
+5. Sandbox destroyed, URL no longer reachable ✓
 
 ### Goal
 A self-contained Python wrapper aiteration the Daytona SDK that the orchestrator can call to manage the target app's sandbox lifecycle. The orchestrator should never import the Daytona SDK directly — all sandbox operations go through this module.
 
-### Functions to implement
+### Functions implemented
 - `create_sandbox() -> str` — creates a new sandbox, returns its ID
 - `deploy_app(sandbox_id: str, source_dir: str)` — uploads the contents of `target-app/` into the sandbox
 - `start_app(sandbox_id: str)` — runs `pip install -r requirements.txt && python app.py` inside the sandbox as a backgiteration process
@@ -239,55 +348,86 @@ This is the one place in the build where a real Daytona API call is made before 
 
 ---
 
-## Phase 3B — Agent Layer
+## Phase 3B — Agent Layer ✅ COMPLETE
 
-**Touches:** `orchestrator/agents.py`
+**Touches:** `orchestrator/agents.py`, `orchestrator/test_agents.py`, `orchestrator/check_reliability.py`, `orchestrator/requirements.txt`
 **Depends on:** Phase 2A (event schema only, for agent_reasoning field shape)
 **Unlocks:** Phase 4
 
 ### Goal
-All LLM interaction lives here. The orchestrator calls these functions and gets back structured Python dicts — it never constructs prompts or parses JSON itself. Developed and fully tested against hardcoded mock responses before any real Kimi API call is made.
+All LLM interaction lives here. The orchestrator calls these functions and gets back structured Python dicts — it never constructs prompts or parses JSON itself. Developed and fully tested against hardcoded mock responses before any real ai& API call is made.
 
-### Kimi reliability test (do this before writing real prompts)
-Write the smallest possible standalone script: one prompt asking the Kimi model to return a fixed JSON shape, run it 5–10 times, assert the output is parseable every time. If it fails more than once in ten, evaluate the Groq fallback before investing time in prompt engineering. This test informs what the retry wrapper needs to handle.
+### ai& reliability test (do this before writing real prompts)
+Write the smallest possible standalone script: one prompt asking `deepseek-ai/deepseek-v4-flash` to return a fixed JSON shape, run it 5–10 times, assert the output is parseable every time. If it fails more than once in ten, step up to `deepseek-ai/deepseek-v4-pro` on the same endpoint — same base URL, one model string change. This test informs what the retry wrapper needs to handle.
 
-### Streaming (confirmed supported)
-Kimi uses the OpenAI-compatible interface — `stream=True` with `base_url="https://api.moonshot.ai/v1"`. Tokens arrive as SSE chunks via `chunk.choices[0].delta.content`. Streaming is used for the **narration field only** — to drive the typewriter effect on the dashboard without waiting for the full response.
+### JSON mode (guaranteed valid JSON output)
+All agent calls use `response_format={"type": "json_object"}`. The model is guaranteed to return syntactically valid JSON — no regex extraction, no preamble stripping, no code-fence handling. The orchestrator calls `json.loads()` directly on `response.choices[0].message.content`.
 
-**Preamble problem and fix:** Kimi often prefixes responses with *"Sure, here's the JSON:"* or similar. Never pipe raw token stream directly to the dashboard. Instead:
-- Accumulate tokens in an internal buffer (never shown)
-- Watch for the opening `{` of the JSON object
-- Once found, begin extracting `narration` content character by character and writing incremental `narration_chunk` events to `events.json` for the dashboard to render as a typewriter
-- Discard everything before `{` silently
-- Prompt ends with *"Respond with only the JSON object, no other text, starting with `{`"* to minimise preamble (belt-and-suspenders with the buffer approach)
+```python
+response = client.chat.completions.create(
+    model="deepseek-ai/deepseek-v4-flash",
+    messages=[...],
+    response_format={"type": "json_object"},
+)
+result = json.loads(response.choices[0].message.content)
+```
 
-**Patch/diff display — do NOT stream, pass whole:**
-The `patched_source` field must be complete before anything can happen with it (file write to sandbox, diff computation, process restart). Buffer the full response, parse JSON on `[DONE]`, then act. The dashboard renders the diff with staggered CSS animation per line (additions fade in sequentially, deletions appear instantly) — the reveal feel comes from animation, not streaming.
+Include `stream_options={"include_usage": True}` on calls where token counts are needed for the status panel.
 
-**Summary of what streams vs what's passed:**
-- `narration` → streamed typewriter via incremental `narration_chunk` events
-- `technical` → passed whole after `[DONE]`, rendered at once
-- `patched_source` → passed whole after `[DONE]`, never streamed
-- `diff` → computed locally from `patched_source`, rendered with staggered animation
+### Typewriter effect — simulated from parsed response
+All agent calls are **non-streaming** (JSON mode + streaming are separate features; use JSON mode for reliability). The typewriter effect on the dashboard is produced by the orchestrator replaying the `narration` field character-by-character after parsing, writing incremental `narration_chunk` events — no live stream required.
+
+```python
+narration = result["agent_reasoning"]["narration"]
+for char in narration:
+    write_event({"type": "narration_chunk", "agent": agent, "char": char})
+    time.sleep(0.022)  # 22ms/char matches the HTML prototype
+```
+
+**Summary of what the model returns vs what the dashboard sees:**
+- `narration` → returned whole in JSON, replayed char-by-char as `narration_chunk` events
+- `technical` → returned whole, written once to the event, rendered at once
+- `patched_source` → returned whole, written to sandbox, diff computed locally
+- `diff` → computed via `difflib`, rendered with staggered animation
 
 ### Functions to implement
 - `attacker_agent(app_url: str, vulnerability_class: str, source_code: str, on_narration_chunk: callable) -> dict`
-  Prompts Kimi with: the target URL, the source code, and a scoped instruction ("look specifically for `{vulnerability_class}` vulnerabilities only — do not look for other vulnerability types"). Streams response, discards preamble before `{`, calls `on_narration_chunk(char)` for each character of the narration field as it arrives. Returns complete parsed dict on `[DONE]`. Expected return shape: `{ method, url, headers, body, agent_reasoning: { narration, technical } }`. Narration voice: terse, first-person, present-tense, clinical and predatory.
+  Calls `deepseek-ai/deepseek-v4-flash` via ai& with JSON mode. Prompt includes the target URL, source code, and scoped instruction ("look specifically for `{vulnerability_class}` vulnerabilities only"). Parses response directly with `json.loads()`. Calls `on_narration_chunk(char)` for each character of the narration field after parsing. Returns complete dict. Expected shape: `{ method, url, headers, body, agent_reasoning: { narration, technical } }`. Narration voice: terse, first-person, present-tense, clinical and predatory.
 
 - `defender_agent(request: dict, response: dict, source_code: str, on_narration_chunk: callable) -> dict`
-  Prompts Kimi with: the raw HTTP request, the raw response, and the current source code. **The vulnerability class is never named** — the defender derives from evidence alone. Same streaming approach. Returns: `{ patched_source, agent_reasoning: { narration, technical } }`. Narration voice: investigative, first-person, shows the discovery arc.
+  Same pattern. Prompt includes raw HTTP request, raw response, and current source code. **Vulnerability class is never named.** Returns: `{ patched_source, agent_reasoning: { narration, technical } }`. Narration voice: investigative, first-person, shows the discovery arc.
 
-- `parse_model_json(raw_text: str) -> dict`
-  Regex-extracts the first `{...}` block. Handles JSON in markdown code fences, stray text before/after.
-
-- Retry wrapper (max 2 attempts): on parse failure, sends a follow-up asking for only the JSON object.
+- Retry wrapper (max 1 re-attempt): only for network/5xx errors — JSON parse failures are eliminated by JSON mode.
 
 ### Mock mode
-Both agent functions accept `mock=True` — bypasses Kimi entirely, returns a hardcoded realistic response. `on_narration_chunk` is still called character by character with a small sleep to simulate the typewriter in mock mode. This is how Phase 4 is developed.
+Both agent functions accept `mock=True` — bypasses ai& entirely, returns a hardcoded realistic response. `on_narration_chunk` is still called character by character to simulate the typewriter in mock mode. This is how Phase 4 is developed.
+
+### Implementation (actual — July 2026)
+
+**`orchestrator/agents.py`** — single-file module (~330 lines), two public functions (`attacker_agent`, `defender_agent`) plus private helpers for the client singleton, retry wrapper, prompt builders, and mock response tables.
+
+Key implementation decisions vs. spec:
+- **The 22ms/char sleep is NOT in `agents.py`.** `_replay_narration()` calls `on_narration_chunk(char)` back-to-back with no delay. The ROADMAP's inline snippet shows the sleep colocated with the write — in the real implementation that pacing belongs to whoever supplies the callback (Phase 4's `main.py`), since a real sleep inside the library function would make every test in `test_agents.py` take real wall-clock seconds. `agents.py` stays a pure "return a dict" module; `main.py` must wrap `write_event(make_narration_chunk(...))` with `time.sleep(0.022)` itself.
+- **Client singleton pattern matches `daytona_client.py`** (built in parallel during this same phase): a module-level `_client` global, lazily constructed by `_get_client()`, reading `AIAND_API_KEY` / `AIAND_BASE_URL` / `AIAND_MODEL` from `os.environ` directly — no `python-dotenv` call inside the module itself, even though `python-dotenv` is now in `orchestrator/requirements.txt` for whatever loads the process environment upstream (shell export, or a future `main.py`/`setup.py` call).
+- **Retry wrapper is narrow**: exactly one retry, only for `APIConnectionError`, `APITimeoutError`, or `APIStatusError` with `status_code >= 500`. 4xx and generic exceptions propagate immediately with no retry.
+- **Defender prompt-builder (`_build_defender_prompt`) takes no `vulnerability_class` parameter at all** — structurally impossible to leak it into the prompt. Verified live: the defender's real narration derives the vuln purely from the request/response pair with no hint.
+- **Defender scope discipline required a prompt tightening after live testing.** The first version of the system prompt ("fix ONLY that issue with the smallest correct change") was not restrictive enough — a live call against the real ai& API patched all three seeded vulnerabilities (SQLi, IDOR, missing-auth) at once, even though the request/response evidence only demonstrated the SQLi. Tightened to explicitly state the request/response pair is the *only* evidence and to not touch any other code path "even if it looks suspicious." Re-verified live post-fix: the defender now patches only the evidenced vulnerability and leaves unrelated endpoints untouched, for both the SQLi and IDOR iterations.
+- **Mock mode content is lifted from `orchestrator/make_fixture.py`'s tone** (clinical/certain attacker, investigative/discovering defender) so mock-mode runs stay visually consistent with the dashboard fixture already used in Phase 2B rehearsal. Defender mock responses are chosen by pattern-matching the request URL fragment (`/login` → sqli reply, `/notes/` → idor reply, else → missing-auth reply), since mock mode has no ground-truth label and is always called immediately after the matching mock attacker response in practice.
+
+**`orchestrator/check_reliability.py`** — standalone manual script (not part of pytest, not auto-run, makes real paid API calls). Runs 10 raw JSON-mode calls against a trivial fixed shape unrelated to the real security prompts, prints per-attempt pass/fail, exits nonzero if more than 1 failure. Run live during this phase: **10/10 passed** against `deepseek-ai/deepseek-v4-flash` — no need to escalate to `deepseek-v4-pro`.
+
+**`orchestrator/requirements.txt`**: `daytona-sdk`, `openai>=1.30.0`, `python-dotenv` (the latter two entries were added by Phase 3A work happening in parallel; `agents.py` itself only requires `openai`).
+
+Verified:
+- 19/19 unit tests pass (`orchestrator/test_agents.py`), zero network calls, zero `AIAND_API_KEY` requirement — every real-path test patches `_get_client`
+- Live smoke test against the real ai& API for both iterations (SQLi and IDOR): attacker produces a correct, executable exploit request with accurate technical reasoning; defender produces a correctly-scoped patch with accurate root-cause narration, verified by inspecting `patched_source` for exactly the expected endpoint change and no others
+- `agent_reasoning` shape from both real-path outputs round-trips cleanly through `events.make_attack_sent()` / `events.make_patch_applied()` with no exception
+
+**Known nuance for Phase 4/5 tuning (not a defect in `agents.py`):** in the live IDOR smoke test, the attacker authenticated as annie (the note owner) and requested her own note by ID — technically not a breach, since she owns it. `agents.py` faithfully relays whatever the model returns; if this recurs during Phase 4/5 rehearsal, tighten the attacker's user-prompt to explicitly supply Bob's credentials/token as the starting foothold rather than leaving credential choice to the model.
 
 ---
 
-## Phase 4 — Orchestrator
+## Phase 4 — Orchestrator ✅ COMPLETE
 
 **Touches:** `orchestrator/main.py`
 **Depends on:** Phase 3A + Phase 3B (both complete)
@@ -324,28 +464,53 @@ The iteration sequence is defined as `[sqli, idor]` for the core build. Iteratio
 ### Verification gate
 With mocks active and the local target app running, execute the full two-iteration sequence and confirm: all events are written to `events.json` in the correct order, the diff in `patch_applied` is non-empty, `exploit_blocked` is set correctly in `verified`, `agent_reasoning` contains both `narration` and `technical` subfields in every agent event, and the dashboard (Phase 2B) renders the full run correctly when pointed at the resulting `events.json`.
 
+### Implementation (actual — July 2026)
+
+**`orchestrator/main.py`** — single-file director (~230 lines). Iteration list is `["sqli", "idor"]` plus `"missing_auth"` appended when `RUN_STRETCH = True` (module-level constant) — all three iterations, including the stretch goal, run by default. `MOCK = True` for this phase; Phase 5 flips it.
+
+Key functions: `reset_events_log()` / `reset_target_db()` (delete `events.json` / `notes.db` before each run — a fresh replay and fresh seed every time); `start_target_app()` / `stop_target_app()` / `restart_target_app()` (subprocess lifecycle — re-running `app.py` also re-seeds the DB via its existing `init_db()` call, so a process restart resets source *and* data in one step, no separate DB-reset call needed); `send_request()` (resolves a relative exploit URL like `/login` against `http://localhost:5000`, since mock attacker responses return paths, not full URLs; real-mode full URLs pass through untouched); `apply_patch()` (writes `patched_source`, returns a `difflib.unified_diff` against the prior contents — diff is always orchestrator-computed, never trusted from the model, per spec); `run_iteration()` (the 14-step sequence verbatim); `main()` (wraps the loop in `try/finally` so `stop_target_app()` always fires, even mid-iteration exceptions).
+
+**Bug found and fixed during Phase 4's first live run:** the Phase 3B mock defender data (`agents.py`'s `_MOCK_DEFENDER_BY_URL_FRAGMENT` / `_MOCK_DEFENDER_DEFAULT`) stored `patched_source` as a bare route-handler fragment (e.g. just the `@app.post("/login")` function), not a full-file replacement — a mismatch against the real API's documented contract ("the FULL replacement contents of the source file"). `test_agents.py`'s shape-only assertions (`isinstance(..., str) and result`) never caught this, since a fragment is still a non-empty string. Writing that fragment as the entire `app.py` broke the app on restart (`NameError: name 'app' is not defined`), which only surfaced once Phase 4 actually restarted the subprocess against the written file.
+
+**Fix:** `agents.py` now stores each mock scenario as an `_original_handler` / `_patched_handler` pair (the exact route-handler text, before and after) and a new `_patch_handler(source_code, original, patched)` helper substitutes the patched handler into whatever full source is passed in, string-replace style — falling back to returning `source_code` unchanged if the original handler text isn't found (keeps mock mode robust to a caller passing arbitrary/placeholder source in tests). `_mock_defender_response()` now takes `source_code` as a third argument and returns a real full-file `patched_source`. Regression tests added: `test_defender_agent_mock_patched_source_is_full_file_not_a_fragment` and `test_defender_agent_mock_idor_patch_preserves_rest_of_file` in `test_agents.py`, both asserting the patched output `compile()`s as valid Python and contains all the *other* route handlers untouched — exactly the gap the original bug slipped through.
+
+**`orchestrator/test_main.py`** — 13 unit tests, all mocking `send_request`/subprocess boundaries (no real network, no real process spawned, no `AIAND_API_KEY` needed): `apply_patch` diff correctness (non-empty on change, empty when unchanged), `send_request` URL resolution (relative → joined with base, absolute → untouched, non-JSON response → falls back to `.text`), `reset_events_log`/`reset_target_db` file-removal semantics, full 9-event-type ordering assertion for one `run_iteration` call (using the real `target-app/app.py` source, not a placeholder, so the mock patch substitution has something real to match against), `exploit_blocked` true/false branching on verify-response status, and `main()`'s `finally`-block subprocess cleanup on both a clean run and one where `run_iteration` raises.
+
+Verified:
+- 34/34 unit tests pass across `orchestrator/test_agents.py` + `orchestrator/test_main.py`
+- 2 consecutive live end-to-end runs (`python orchestrator/main.py`) against the real local target app, mock agents: all 3 iterations (sqli, idor, missing_auth) completed with `exploit_blocked: true` and a non-empty diff every time; `target-app/app.py` on disk after a run contains all three patches cumulatively (parameterised login query, ownership check on `GET /notes/<id>`, admin-role check on `POST /reset`) and is valid, importable Python
+- Port 5000 confirmed free and no orphaned `python.exe` process after both runs (subprocess cleanup via `finally` verified under normal exit)
+- Dashboard (`streamlit run dashboard/app.py`) started clean against the real orchestrator-produced `events.json` (797 events for a 3-iteration run: 776 `narration_chunk`, 6 `agent_thinking`, 3 each of the remaining 7 types) — server log showed no exceptions while polling; full interactive Playwright verification was not possible this session (the Playwright MCP server is configured in `~/.claude/settings.json` but wasn't attached to the session — needs a VS Code restart to activate per existing project memory), so this is HTTP/log-level confirmation only, not a rendered-DOM check
+
+**Known scope note:** the mock IDOR scenario only exercises `GET /notes/<id>` (VULN-2a); the mock defender patch therefore leaves `PUT /notes/<id>` (VULN-2b) unpatched. This matches the mock attacker table's existing scope (`_MOCK_ATTACKER["idor"]` only ever requests a GET) and isn't a Phase 4 regression — flagged here in case Phase 5's real (non-mock) agent calls behave differently, since the real defender prompt has previously over-patched during Phase 3B testing (see Phase 3B's "Known nuance" note) and could plausibly patch both routes from one piece of evidence.
+
 ---
 
-## Phase 5 — Live Integration
+## Phase 5 — Live Integration ✅ COMPLETE (wiring + tests; live sandbox run pending)
 
-**Touches:** `.env`, `orchestrator/main.py` (swap mock flags), `orchestrator/agents.py` (Kimi endpoint wired), `orchestrator/daytona_client.py` (confirmed working from Phase 3A)
+**Touches:** `.env`, `orchestrator/main.py` (swap mock flags), `orchestrator/agents.py` (ai& endpoint wired), `orchestrator/daytona_client.py` (confirmed working from Phase 3A)
 **Depends on:** Phase 4 (full mock run confirmed working)
 **Unlocks:** Phase 6
 
 ### Goal
 Replace the two stubs with real external calls, in a controlled order. The rest of the codebase doesn't change — this phase is purely about swapping the mock seam for the real thing.
 
-### Step 1 — Kimi integration
-- Wire the Kimi API endpoint and key from `.env` into `agents.py`
+### Step 1 — ai& integration
+- Wire `AIAND_API_KEY` from `.env` into `agents.py`; client init is:
+  ```python
+  from openai import OpenAI
+  client = OpenAI(base_url="https://api.aiand.com/v1", api_key=os.environ["AIAND_API_KEY"])
+  ```
+  Model string: `"deepseek-ai/deepseek-v4-flash"`
 - Run the attacker agent once against the locally-running target app (not Daytona yet) for the SQLi iteration
 - Inspect the raw model output, confirm `parse_model_json` handles it, confirm the returned request dict is sensible
-- If the first real call produces a nonsensical exploit request, tune the prompt and re-run (max 2 tune cycles before evaluating Groq fallback)
+- If the first real call produces a nonsensical exploit request, tune the prompt and re-run (max 2 tune cycles before stepping up to `deepseek-ai/deepseek-v4-pro` on the same endpoint)
 - Do the same for the defender agent
 - Once both agents produce reliable output on the local target, proceed to Step 2
 
 ### Step 2 — Daytona integration
 - Replace the `subprocess.Popen` local-app management in `main.py` with calls to `daytona_client.py`
-- Run the full two-iteration sequence against a live Daytona sandbox with real Kimi calls
+- Run the full two-iteration sequence against a live Daytona sandbox with real ai& API calls
 - Confirm the sandbox URL is reachable, exploits land, patches deploy, restarts work, `verified` events show `exploit_blocked: true`
 - Wrap the entire orchestrator run in `try/finally` to ensure `delete_sandbox()` always fires
 
@@ -367,9 +532,139 @@ python orchestrator/main.py    # iteration loop starts immediately, sandbox alre
 The dashboard shows the URL the moment `sandbox_ready` lands. By the time you finish your 30-second intro and say *"let's start"*, the sandbox is warm and `main.py` fires the first iteration immediately with no delay.
 
 ### Credit discipline
-- Step 1: at most 4 real Kimi calls total (1 attacker + 1 defender per iteration × 2 iterations)
+- Step 1: at most 4 real ai& API calls total (1 attacker + 1 defender per iteration × 2 iterations)
 - Step 2: 1 full end-to-end run — inspect everything, fix any issues, then treat the next run as a rehearsal (Phase 6)
 - Do not iterate on live infra; fix issues against mocks and re-run once
+
+### Implementation (actual — July 2026)
+
+**One deliberate deviation from the plan above:** ai& API calls are now real
+**streaming** calls (`stream=True` + `stream_options={"include_usage": True}`),
+not the originally-planned non-streaming JSON-mode call with a simulated
+post-parse replay. Confirmed via `docs.aiand.com` that `response_format:
+{"type": "json_object"}` and `stream: true` compose freely — JSON mode only
+constrains the *final* assembled content to be valid JSON; streaming just
+delivers that content incrementally as `delta.content` text fragments,
+terminated by the OpenAI-shape `[DONE]` marker. There is no such thing as a
+"streamed structured field," only a streamed raw JSON string, unparseable
+until the buffer is complete. Design: raw text deltas are pushed live as a
+new `stream_chunk` event so the dashboard shows real token-by-token movement
+from the first byte; once the stream ends, `agents.py` parses the fully
+assembled buffer exactly as before and the existing narration/wire-feed
+rendering takes over unchanged — the raw-stream view is simply replaced.
+This also unlocks real per-call token usage (`llm_usage` event), which
+nothing tracked before (the ROADMAP's originally-speced Calls/Tokens/Latency
+sidebar panel was never actually built in the real Phase 2B implementation —
+this phase adds a lightweight nav-bar counter instead, not that panel).
+
+**`orchestrator/events.py`** — two additive event constructors:
+`make_stream_chunk(agent, chunk, iteration, vulnerability_class)` (one per
+raw SSE text fragment; unlike `narration_chunk`, `chunk` length is
+unconstrained since real deltas arrive in arbitrary-sized pieces) and
+`make_llm_usage(agent, prompt_tokens, completion_tokens, total_tokens,
+iteration, vulnerability_class)` (one per real model call, written once the
+stream completes).
+
+**`orchestrator/agents.py`** — `_call_model` (non-streaming) replaced by
+`_call_model_streaming(messages, on_raw_chunk) -> (parsed_dict, usage_dict)`:
+opens the stream, forwards each non-empty `delta.content` to `on_raw_chunk`
+as it arrives, captures `usage` off the trailer chunk, and
+`json.loads()`s the assembled buffer once the stream ends. The one-retry-on-
+network/5xx policy from Phase 3B is unchanged, now wrapping the streaming
+call. `attacker_agent`/`defender_agent` gained an optional `on_raw_chunk`
+parameter and now return `(result, usage)` instead of a bare dict — mock
+mode ignores `on_raw_chunk` entirely (there's no real stream to replay) and
+always returns `usage=None`, so `main.py` skips emitting `llm_usage` in mock
+runs. The existing `_replay_narration` char-by-char callback is unchanged
+and still runs in both modes once the (real or mock) response is available
+— narration pacing was never coupled to the network call.
+
+**`orchestrator/daytona_client.py`** — one addition,
+`get_sandbox_info(sandbox_id) -> {region, created_at, cpu, memory}`, reading
+directly off the SDK's `Sandbox` object (`sandbox.target` is Daytona's
+internal name for what the dashboard shows as "region"; confirmed by
+inspecting the installed `daytona_sdk` package rather than guessing field
+names). Feeds the `sandbox_ready` event's payload, which Phase 3A's
+integration tests never needed since they didn't touch the dashboard-facing
+event.
+
+**`orchestrator/main.py`** — now loads `.env` via `python-dotenv` (dead
+weight since Phase 3B's `requirements.txt` entry — nothing ever called
+`load_dotenv()` before this) and injects Daytona credentials via
+`load_daytona_env.inject_env()` before any `daytona_client` import. `MOCK`
+flipped `True` → `False`. Rather than deleting the local-subprocess path,
+`main()` now branches on `MOCK`: mock mode still runs the target app as a
+local subprocess exactly as in Phase 4 (kept deliberately, so local
+dev/testing stays free and fast — see credit discipline above), real mode
+runs it in a live Daytona sandbox. `run_iteration()` takes a `target` dict
+(`{"mode": "local"|"daytona", ...}`) instead of a bare subprocess handle, so
+the two backends share one code path for the attack/patch/verify sequence.
+New `start_sandbox()` / `stop_sandbox()` wrap sandbox lifecycle and honor
+`orchestrator/.sandbox_id` (see setup.py below) so a pre-warmed sandbox is
+reused instead of creating a second one — cleared on teardown. New
+`make_raw_chunk_callback()` mirrors `make_narration_callback()`'s shape but
+emits `stream_chunk` with no artificial delay (real network pacing already
+paces it). `run_iteration()` emits `llm_usage` after each real call when
+usage is non-`None`.
+
+**`orchestrator/setup.py`** (new file) — thin pre-warm script per the plan
+above: creates/deploys/starts the sandbox via `start_sandbox()`, writes its
+ID to `orchestrator/.sandbox_id`, prints the URL. Lets sandbox spin-up
+happen during the presenter's verbal intro instead of as dead air after
+"let's start" — `main.py` picks up the same sandbox via the persisted ID
+file instead of creating a second one.
+
+**`dashboard/app.py`** — `apply_event()` gained two branches: `stream_chunk`
+appends to `attacker_raw_stream`/`defender_raw_stream` session-state buffers
+(hot path, same treatment as `narration_chunk`); `llm_usage` increments
+`llm_calls`/sums `llm_tokens`. New `_feed_raw_stream_block(agent, raw_text)`
+renders the in-progress raw JSON text with a blinking caret, reusing the
+existing `.aos-technical` monospace CSS class (no new styles needed) —
+shown only while that agent is active and its raw buffer is non-empty *and*
+its clean narration hasn't landed yet, so the raw block and the narration
+card never render simultaneously (verified live: the raw block is fully
+replaced by the narration card the instant the parsed response arrives, not
+merely covered by an empty duplicate card). `render_nav_bar()` shows a
+`"{calls} calls · {tokens:,} tokens"` line next to the existing model tag,
+suppressed entirely while `llm_calls == 0` so it doesn't clutter the
+pre-run empty state.
+
+Verified:
+- 92/92 unit tests pass across the full repo (`orchestrator/` + `dashboard/`
+  combined), zero real network/API/sandbox calls — every real-path test
+  mocks the client boundary at the same seam Phase 3A/3B established. Order-
+  independence re-confirmed after fixing a test-isolation bug where
+  `monkeypatch.setitem(sys.modules, ...)` alone didn't cover
+  `orchestrator.daytona_client` once some other test had already imported it
+  as a real submodule (Python also caches it as an attribute on the
+  `orchestrator` package object) — fixed by patching both.
+- `pyflakes` clean across every new/modified source and test file
+- 1 live mock-mode end-to-end run (`MOCK` overridden to `True` without
+  touching the file) via `python -c "..."`, confirming Phase 5's rewrite of
+  `main.py` didn't regress the Phase 4 control flow: all 3 iterations
+  completed, 797 events (identical count to Phase 4's documented baseline),
+  zero `stream_chunk`/`llm_usage` events (correctly absent in mock mode),
+  all three `verified.exploit_blocked == true`. Port 5000 confirmed free and
+  no orphaned process afterward; `target-app/app.py` restored via
+  `git checkout` post-run.
+- Live Playwright verification against a real `streamlit run` server:
+  loaded the empty-state dashboard (no calls/tokens line, as designed at
+  `llm_calls == 0`), then hand-injected a realistic `stream_chunk` +
+  `llm_usage` sequence directly into `events.json` (the same shape a real
+  ai& streaming call produces) — confirmed the raw JSON text streamed into
+  the attacker's card live with a blinking caret, the nav bar's "1 calls ·
+  908 tokens" line appeared, and the iteration card advanced to SCANNING.
+  Followed with a real `attack_sent` event and confirmed the raw-stream
+  block was fully replaced by the clean italic narration card, technical
+  detail, and red "Breach confirmed" wire block — zero console
+  errors/warnings throughout. Server process and all test artifacts
+  (`events.json`, `.playwright-mcp/` screenshots) cleaned up after
+  verification.
+- **Not yet done this session (deliberately, per credit discipline):** a
+  real end-to-end run against a live Daytona sandbox with real ai& streaming
+  calls. Everything up to that boundary is now proven with mocks; the first
+  real run should be treated as the single Step 2 run the credit-discipline
+  section above budgets for, not a debugging loop.
 
 ---
 

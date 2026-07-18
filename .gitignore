@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+*.db
+events.json
+PROJECT_SPEC.md
+ROADMAP.md
+.claude/
+.pytest_cache/
+.playwright-mcp/
+Attack on Sandbox Dashboard - Standalone Claude Design.html
