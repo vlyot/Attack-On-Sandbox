@@ -2,15 +2,12 @@
 
 video demo: https://youtu.be/VJAmXWpQCRA
 
-NOTE: due to time constraints i was not able to edit the video or refine the streaming. the llm will output garbage at first but will then form words and sentences 
-
-
 **Two AI agents that don't trust each other.** One attacks a live, deliberately
 vulnerable Flask API. The other patches it in response — from evidence alone,
 with no idea what the attacker was told to look for. Every request, response,
-and patch is real, running against a real service in an isolated
-[Daytona](https://daytona.io) sandbox.
+and patch is real, running against a real service in an isolated [Daytona](https://daytona.io) sandbox.
 
+_This is my take on what a continuous adversarial AI loop could look like in practice — not a finished product, but a proof of concept for the shape of the idea._
 
 > Most AI security demos are one agent checking its own work. We built two
 > agents that don't trust each other — one attacks, one defends, and you
@@ -24,7 +21,7 @@ and patch is real, running against a real service in an isolated
    vulnerability class. It reasons about the code, builds a real exploit,
    and fires it at the sandbox for real.
 2. **Defender** gets only the raw HTTP request, the raw response, and the
-   current source — never told what the vulnerability *is*. It has to
+   current source — never told what the vulnerability _is_. It has to
    figure that out from the evidence, then rewrite the file.
 3. The orchestrator deploys the patch, restarts the app, and **replays the
    attacker's exact original exploit** against it. If it now fails safely,
@@ -53,7 +50,7 @@ the scope constraint on the attacker prompt — one line — and every piece of
 this scales independently:
 
 - **No more fixed vulnerability list.** An unscoped attacker just gets
-  source + a live URL and is told to find *anything* exploitable: SQLi,
+  source + a live URL and is told to find _anything_ exploitable: SQLi,
   IDOR, missing auth, SSTI, command injection, insecure deserialization,
   hardcoded secrets, whatever's actually there. The defender still works
   from the request/response pair alone, so it stays honest regardless of
@@ -99,6 +96,7 @@ it and pushes each line to the browser as a Server-Sent Event. Any other
 consumer — a terminal, a Slack bot, a Grafana panel — would work identically.
 
 **Sponsor tech, both load-bearing:**
+
 - **[Daytona](https://daytona.io)** — hosts and isolates the vulnerable
   target app; torn down and respun between iterations.
 - **[ai&](https://aiand.com)** (`deepseek-ai/deepseek-v4-flash`) — powers
