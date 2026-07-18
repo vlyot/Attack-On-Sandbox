@@ -3,13 +3,12 @@ Attack on Sandbox — Streamlit dashboard.
 
 Reads newline-delimited JSON from events.json, updates session state on each
 poll, and renders a single vertical feed (nav bar + round gallery above it):
-  - Nav bar        (brand, sandbox/model tags, Reset)
+  - Nav bar        (brand, Reset)
+  - Sidebar        (sticky: every sandbox this run has created, live + past)
   - Round gallery  (3 iteration cards: numeral + stage, no endpoint)
   - Feed           (narration -> wire -> taunt -> narration -> diff -> wire,
                      in event order, styled after the project's HTML design
                      reference)
-
-Plus a "Live Evidence" tab that auto-fires before/after HTTP probes.
 """
 
 import json
@@ -18,7 +17,6 @@ import sys
 import time
 from pathlib import Path
 
-import requests as http_requests
 import streamlit as st
 
 # ---------------------------------------------------------------------------
@@ -65,6 +63,11 @@ _STATE_DEFAULTS: dict = {
     "sandbox_created_at":  "",
     "sandbox_spec":       {},
     "sandbox_status":     "idle",
+    # Every sandbox this run has created, in order — each entry a dict with
+    # id/url/region/created_at/status/iteration/vuln_class. The current
+    # sandbox_* fields above always mirror the last entry here; this list is
+    # what lets the sidebar show past sandboxes too, not just the live one.
+    "sandbox_history":    [],
     "iteration":          0,
     "stage":              "idle",
     "vuln_class":         "",
@@ -83,11 +86,6 @@ _STATE_DEFAULTS: dict = {
     "llm_tokens":          0,
     "active_agent":       None,
     "active_agent_label": "",
-    "live_before":        None,
-    "live_after":         None,
-    # flags that tell render_live_evidence_tab to fire a probe this cycle
-    "_probe_before":      False,
-    "_probe_after":       False,
     "history":            [],
     # True once the current iteration's blocks have been frozen into
     # history at iteration_complete — stops render_feed() from also
@@ -219,13 +217,21 @@ def apply_event(event: dict) -> bool:
         st.session_state.sandbox_status  = "running"
         st.session_state.iteration      = event.get("iteration", 0)
         st.session_state.vuln_class     = event.get("vulnerability_class", "")
+        st.session_state.sandbox_history.append({
+            "id":         p.get("sandbox_id", ""),
+            "url":        p.get("url", ""),
+            "region":     p.get("region", ""),
+            "created_at": p.get("created_at", ""),
+            "spec":       p.get("spec", {}),
+            "status":     "running",
+            "iteration":  event.get("iteration", 0),
+            "vuln_class": event.get("vulnerability_class", ""),
+        })
         # reset per-sandbox state
         st.session_state.diff           = ""
         st.session_state.wire_request   = None
         st.session_state.wire_response  = None
         st.session_state.wire_blocked   = None
-        st.session_state.live_before    = None
-        st.session_state.live_after     = None
         if not st.session_state.source_code and TARGET_APP_SOURCE.exists():
             try:
                 st.session_state.source_code = TARGET_APP_SOURCE.read_text(encoding="utf-8")
@@ -249,7 +255,6 @@ def apply_event(event: dict) -> bool:
         st.session_state.wire_blocked       = None
         st.session_state.active_agent       = None
         st.session_state.active_agent_label = ""
-        st.session_state._probe_before      = True   # trigger live before-probe
         st.session_state._iteration_frozen  = False
 
     elif t == "agent_thinking":
@@ -311,41 +316,22 @@ def apply_event(event: dict) -> bool:
         st.session_state.wire_request      = p.get("request")
         st.session_state.wire_response     = p.get("response")
         st.session_state.wire_blocked      = p.get("exploit_blocked", False)
-        st.session_state._probe_after      = True   # trigger live after-probe
+        if st.session_state.sandbox_history:
+            st.session_state.sandbox_history[-1]["status"] = "verified"
 
     elif t == "iteration_complete":
         st.session_state.active_agent = None
         st.session_state.history.extend(_current_iteration_blocks())
         st.session_state._iteration_frozen = True
 
-    # sandbox_destroyed — no-op (already visible in history)
+    elif t == "sandbox_destroyed":
+        sbox_id = p.get("sandbox_id", "")
+        for entry in st.session_state.sandbox_history:
+            if entry["id"] == sbox_id:
+                entry["status"] = "destroyed"
+                break
 
     return False
-
-
-# ---------------------------------------------------------------------------
-# HTTP probe (Live Evidence tab)
-# ---------------------------------------------------------------------------
-
-def fire_live_probe(url: str, req: dict) -> dict:
-    """Fire a single HTTP request and return {status, body}. Never raises."""
-    try:
-        method  = req.get("method", "GET").upper()
-        headers = req.get("headers") or {}
-        body    = req.get("body")
-        resp = http_requests.request(
-            method, url,
-            headers=headers,
-            json=body if body is not None else None,
-            timeout=5,
-        )
-        try:
-            body_text = resp.json()
-        except Exception:
-            body_text = resp.text
-        return {"status": resp.status_code, "body": body_text}
-    except Exception as exc:
-        return {"status": 0, "body": f"error: {exc}"}
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +401,60 @@ body { font-family: var(--font-body); }
 .aos-url {
     font-size: 11px; color: rgba(32,31,29,0.55); letter-spacing: 0.02em;
     text-align: right; margin-top: 4px;
+}
+
+/* — sidebar (sandbox roster) — */
+[data-testid="stSidebar"] {
+    background: var(--feed-bg) !important;
+}
+[data-testid="stSidebar"] * {
+    color: var(--feed-text) !important;
+}
+.aos-sidebar-title {
+    font-family: var(--font-heading); font-weight: 600; font-size: 15px;
+    letter-spacing: 0.02em; margin-bottom: 2px;
+}
+.aos-sidebar-usage {
+    font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+    color: var(--feed-muted); margin-bottom: 4px;
+}
+.aos-sbox-card {
+    display: flex; flex-direction: column; gap: 6px;
+    padding: 10px 12px; margin-bottom: 10px;
+    border: 1px solid var(--feed-divider); border-radius: 6px;
+    background: rgba(255,255,255,0.03);
+}
+.aos-sbox-card.running { border-color: var(--color-accent); }
+.aos-sbox-card.verified { border-color: var(--safe); }
+.aos-sbox-card.destroyed { opacity: 0.55; }
+.aos-sbox-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+.aos-sbox-tag {
+    font-size: 10px; letter-spacing: 0.03em;
+    padding: 2px 8px; border-radius: 3px;
+    border: 1px solid var(--color-accent); color: var(--color-accent);
+}
+.aos-sbox-url {
+    font-family: ui-monospace, Menlo, monospace; font-size: 10.5px;
+    color: var(--feed-muted); word-break: break-all;
+}
+.aos-sbox-status {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+}
+.aos-sbox-status-dot { width: 6px; height: 6px; border-radius: 50%; }
+.aos-sbox-status.running .aos-sbox-status-dot { background: var(--color-accent); animation: livePulse 1.1s ease-in-out infinite; }
+.aos-sbox-status.verified .aos-sbox-status-dot { background: var(--safe); }
+.aos-sbox-status.destroyed .aos-sbox-status-dot { background: var(--feed-muted); }
+.aos-sbox-status.running { color: var(--color-accent); }
+.aos-sbox-status.verified { color: var(--safe); }
+.aos-sbox-status.destroyed { color: var(--feed-muted); }
+.aos-sbox-meta {
+    font-family: ui-monospace, Menlo, monospace; font-size: 10.5px;
+    color: var(--feed-muted);
+}
+.aos-sidebar-empty {
+    font-family: var(--font-body); font-style: italic; font-size: 12px;
+    color: var(--feed-muted);
 }
 
 /* — round gallery — */
@@ -547,21 +587,62 @@ def render_nav_bar() -> None:
             '<div class="aos-tagline">Two agents. One sandbox. No trust.</div>'
         )
     with col_tags:
-        url = st.session_state.sandbox_url
-        sandbox_tag = "Daytona sandbox"
-        calls, tokens = st.session_state.llm_calls, st.session_state.llm_tokens
-        usage_line = f'<div class="aos-url">{calls} calls · {tokens:,} tokens</div>' if calls else ""
         st.html(
-            f'<div style="text-align:right">'
-            f'<span class="aos-tag">{sandbox_tag}</span>&nbsp;'
+            f'<div style="text-align:right; padding-top: 6px">'
+            f'<span class="aos-tag">Daytona sandbox</span>&nbsp;'
             f'<span class="aos-tag">{MODEL_TAG}</span>'
-            f'<div class="aos-url">{url or "Waiting for sandbox…"}</div>'
-            f'{usage_line}'
             f'</div>'
         )
     with col_action:
         st.html('<div style="height: 18px"></div>')
         render_reset_button()
+
+
+def _sbox_card_html(entry: dict) -> str:
+    status = entry.get("status", "running")
+    sbox_id = entry.get("id", "")
+    url = entry.get("url", "")
+    region = entry.get("region", "")
+    vc_label = VULN_LABELS.get(entry.get("vuln_class", ""), entry.get("vuln_class", ""))
+    round_num = entry.get("iteration", 0)
+    meta_bits = [b for b in (
+        f"Iteration {ROUND_NUMERALS.get(round_num, round_num)} · {vc_label}" if vc_label else "",
+        region,
+    ) if b]
+    meta_line = f'<div class="aos-sbox-meta">{_escape(" · ".join(meta_bits))}</div>' if meta_bits else ""
+    return (
+        f'<div class="aos-sbox-card {status}">'
+        f'<div class="aos-sbox-tags">'
+        f'<span class="aos-sbox-tag">{_escape(sbox_id) or "sandbox"}</span>'
+        f'</div>'
+        f'<div class="aos-sbox-url">{_escape(url) or "—"}</div>'
+        f'{meta_line}'
+        f'<div class="aos-sbox-status {status}">'
+        f'<span class="aos-sbox-status-dot"></span>{status}'
+        f'</div>'
+        f'</div>'
+    )
+
+
+def render_sidebar() -> None:
+    """Sticky sidebar listing every Daytona sandbox this run has created —
+    not just the currently-live one — plus overall ai& call/token usage.
+    Uses Streamlit's native sidebar so it stays pinned while the feed scrolls.
+    """
+    with st.sidebar:
+        st.html('<div class="aos-sidebar-title">Daytona sandboxes</div>')
+        calls, tokens = st.session_state.llm_calls, st.session_state.llm_tokens
+        if calls:
+            st.html(f'<div class="aos-sidebar-usage">{MODEL_TAG} · {calls} calls · {tokens:,} tokens</div>')
+
+        history = st.session_state.sandbox_history
+        if not history:
+            st.html('<div class="aos-sidebar-empty">Waiting for the first sandbox…</div>')
+            return
+
+        # Most recent first so the live sandbox is always at the top.
+        for entry in reversed(history):
+            st.html(_sbox_card_html(entry))
 
 
 def _round_stage_label(round_num: int) -> str:
@@ -885,71 +966,69 @@ def render_feed() -> None:
         st.html('<div class="aos-feed"><div class="aos-feed-empty">Waiting for the first iteration…</div></div>')
         return
 
-    st.html(f'<div class="aos-feed">{"".join(blocks)}</div>')
-
-
-def render_live_evidence_tab() -> None:
-    """Fires live HTTP probes and shows before/after side by side."""
-    # Fire probes triggered by event processing
-    req = st.session_state.wire_request
-    url = st.session_state.sandbox_url
-
-    if st.session_state._probe_before and req and url:
-        st.session_state.live_before  = fire_live_probe(req.get("url", url), req)
-        st.session_state._probe_before = False
-
-    if st.session_state._probe_after and req and url:
-        st.session_state.live_after  = fire_live_probe(req.get("url", url), req)
-        st.session_state._probe_after = False
-
-    before = st.session_state.live_before
-    after  = st.session_state.live_after
-
-    col_b, col_a = st.columns(2)
-    with col_b:
-        st.markdown("**Before patch**")
-        if before:
-            color = "#e53935" if before["status"] < 400 else "#43a047"
-            body  = json.dumps(before["body"], indent=2) if isinstance(before["body"], dict) else str(before["body"])
-            st.html(f'<span style="color:{color}">HTTP {before["status"]}</span>')
-            st.code(body, language="json")
-        else:
-            st.caption("Fires on iteration_start…")
-    with col_a:
-        st.markdown("**After patch**")
-        if after:
-            color = "#43a047" if after["status"] >= 400 else "#e53935"
-            body  = json.dumps(after["body"], indent=2) if isinstance(after["body"], dict) else str(after["body"])
-            st.html(f'<span style="color:{color}">HTTP {after["status"]}</span>')
-            st.code(body, language="json")
-        else:
-            st.caption("Fires on verified…")
+    # unsafe_allow_javascript: st.html strips <script> tags by default
+    # (DOMPurify), which silently no-ops _feed_live_timer_block's clock and
+    # the auto-scroll script below. Safe here — every value interpolated
+    # into these blocks passes through _escape() first, so no untrusted
+    # input ever reaches this HTML.
+    #
+    # Auto-scroll: a marker div after the last block, scrolled into view on
+    # every render. scrollIntoView on an element already in view is a
+    # harmless no-op, so this is safe to re-run every ~80ms poll cycle
+    # without fighting a user who has manually scrolled up to read history —
+    # it only moves the viewport when new content actually pushed the
+    # marker out of view.
+    st.html(
+        f'<div class="aos-feed">{"".join(blocks)}'
+        f'<div id="aos-feed-end"></div>'
+        f'<script>'
+        f'document.getElementById("aos-feed-end")'
+        f'?.scrollIntoView({{behavior: "auto", block: "end"}});'
+        f'</script>'
+        f'</div>',
+        unsafe_allow_javascript=True,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-# Narration_chunk events are capped lower than MAX_EVENTS_PER_CYCLE and paced
-# with a small per-char sleep so the typewriter reveal is visible on screen
-# instead of jumping in large blocks — non-narration events still process at
-# full speed within the same cycle.
+# Narration_chunk and stream_chunk are capped lower than MAX_EVENTS_PER_CYCLE
+# and paced with a small per-char sleep so both the narration typewriter and
+# the raw-JSON stream reveal smoothly on screen instead of jumping in large
+# blocks. stream_chunk deltas arrive unpaced from a real ai& call and can
+# burst dozens of times per second — without this cap each burst triggers a
+# full feed re-render (st.html() redraws the whole .aos-feed div every
+# rerun), which is what caused visible flashing during real (non-mock) runs.
+# Non-narration/stream events still process at full speed within the cycle.
 MAX_NARRATION_CHARS_PER_CYCLE = 15
 NARRATION_CHAR_DELAY_S = 0.01
+MAX_STREAM_CHARS_PER_CYCLE = 15
+STREAM_CHAR_DELAY_S = 0.01
 
 
 def _process_events_this_cycle(events: list[dict]) -> list[dict]:
     """Apply events up to the per-cycle caps, returning any left for next cycle."""
     narration_chars_used = 0
+    stream_chars_used = 0
     processed = 0
     for event in events:
-        if event.get("type") == "narration_chunk":
+        event_type = event.get("type")
+        if event_type == "narration_chunk":
             if narration_chars_used >= MAX_NARRATION_CHARS_PER_CYCLE:
                 break
             apply_event(event)
             narration_chars_used += 1
             processed += 1
             time.sleep(NARRATION_CHAR_DELAY_S)
+        elif event_type == "stream_chunk":
+            if stream_chars_used >= MAX_STREAM_CHARS_PER_CYCLE:
+                break
+            apply_event(event)
+            stream_chars_used += len(event.get("payload", {}).get("chunk", ""))
+            processed += 1
+            time.sleep(STREAM_CHAR_DELAY_S)
         else:
             if processed >= MAX_EVENTS_PER_CYCLE:
                 break
@@ -963,7 +1042,7 @@ def main() -> None:
         page_title="Attack on Sandbox",
         page_icon="⚔️",
         layout="wide",
-        initial_sidebar_state="collapsed",
+        initial_sidebar_state="expanded",
     )
     init_state()
     inject_css()
@@ -980,15 +1059,11 @@ def main() -> None:
         st.session_state.cursor = max(0, st.session_state.cursor - rewind)
 
     # ---- layout ------------------------------------------------------------
+    render_sidebar()
     render_nav_bar()
     render_round_gallery()
     st.divider()
-
-    tab_demo, tab_live = st.tabs(["Demo", "Live Evidence"])
-    with tab_demo:
-        render_feed()
-    with tab_live:
-        render_live_evidence_tab()
+    render_feed()
 
     # ---- rerun loop --------------------------------------------------------
     if got_events:

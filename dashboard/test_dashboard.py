@@ -400,28 +400,6 @@ app.render_reset_button()
     assert at.button[0].label == "Running…"
 
 
-def test_render_live_evidence_tab_shows_existing_before_and_after_results(tmp_path):
-    script = f"""
-import sys
-sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})
-import streamlit as st
-from dashboard import app
-
-app.init_state()
-st.session_state.wire_request = {{"method": "GET", "url": "/notes/1", "headers": {{}}, "body": None}}
-st.session_state.sandbox_url = "https://example.daytona.io"
-st.session_state.live_before = {{"status": 200, "body": {{"ok": True}}}}
-st.session_state.live_after = {{"status": 403, "body": {{"error": "forbidden"}}}}
-app.render_live_evidence_tab()
-"""
-    at = AppTest.from_string(script)
-    at.run()
-    assert len(at.exception) == 0, at.exception
-    markdown_values = [node.value for node in at.markdown]
-    assert any("Before patch" in value for value in markdown_values)
-    assert any("After patch" in value for value in markdown_values)
-
-
 # ---------------------------------------------------------------------------
 # apply_event — regression guard, full fixture replay still works
 # ---------------------------------------------------------------------------
@@ -629,3 +607,237 @@ st.session_state['_streaming_html'] = "".join(blocks_streaming)
     assert "aos-live-timer" in waiting_html
     assert "aos-live-timer" not in streaming_html
     assert '{"method"' in streaming_html
+
+
+# ---------------------------------------------------------------------------
+# _process_events_this_cycle — stream_chunk pacing (anti-flash cap)
+# ---------------------------------------------------------------------------
+
+def _stream_chunk_events(chunks, agent="attacker", iteration=1, vuln="sqli"):
+    return [
+        {"type": "stream_chunk", "iteration": iteration, "vulnerability_class": vuln,
+         "payload": {"agent": agent, "chunk": c}}
+        for c in chunks
+    ]
+
+
+def test_process_events_caps_stream_chunk_chars_per_cycle():
+    script = f"""
+import sys
+sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})
+import streamlit as st
+from dashboard import app
+app.init_state()
+
+events = {_stream_chunk_events(["ab", "cd", "ef", "gh", "ij", "kl", "mn", "op", "qr", "st"])!r}
+remaining = app._process_events_this_cycle(events)
+
+st.session_state['_remaining_count'] = len(remaining)
+st.session_state['_buffer'] = st.session_state.attacker_raw_stream
+"""
+    at = AppTest.from_string(script)
+    at.run()
+    assert len(at.exception) == 0, at.exception
+    # MAX_STREAM_CHARS_PER_CYCLE=15: "ab"+"cd"+"ef"+"gh"+"ij"+"kl"+"mn"+"op" = 16 chars
+    # consumed once the 15-char budget is exceeded (stops after the chunk
+    # that crosses the threshold, matching narration_chunk's same-cycle semantics)
+    assert at.session_state["_buffer"] == "abcdefghijklmnop"
+    assert at.session_state["_remaining_count"] == 2  # "qr", "st" deferred to next cycle
+
+
+def test_process_events_stream_chunk_does_not_starve_other_event_types():
+    """A burst of stream_chunk events capped mid-cycle must not block
+    non-narration/non-stream events later in the same batch — narration_chunk
+    already gets this via the elif chain; stream_chunk must too."""
+    script = f"""
+import sys
+sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})
+import streamlit as st
+from dashboard import app
+app.init_state()
+
+stream_events = {_stream_chunk_events(["x" * 20])!r}
+usage_event = {{"type": "llm_usage", "iteration": 1, "vulnerability_class": "sqli",
+                 "payload": {{"agent": "attacker", "prompt_tokens": 1,
+                              "completion_tokens": 1, "total_tokens": 2}}}}
+events = stream_events + [usage_event]
+remaining = app._process_events_this_cycle(events)
+
+st.session_state['_remaining_count'] = len(remaining)
+st.session_state['_calls'] = st.session_state.llm_calls
+"""
+    at = AppTest.from_string(script)
+    at.run()
+    assert len(at.exception) == 0, at.exception
+    # The single 20-char stream_chunk exceeds the 15-char cap on its own but
+    # is still applied whole (chunks aren't split mid-delta); nothing else
+    # follows it in this test so nothing is starved — remaining is empty.
+    assert at.session_state["_remaining_count"] == 0
+    assert at.session_state["_calls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# apply_event — sandbox_history (sidebar roster of every sandbox this run
+# has created, not just the currently-live one)
+# ---------------------------------------------------------------------------
+
+def test_sandbox_ready_appends_to_sandbox_history():
+    script = f"""
+import sys
+sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})
+import streamlit as st
+from dashboard import app
+app.init_state()
+app.apply_event({{"type": "sandbox_ready", "iteration": 1, "vulnerability_class": "sqli",
+                   "payload": {{"sandbox_id": "sbox-1", "url": "https://a.daytona.io",
+                                "region": "us-east-1", "created_at": "t1", "spec": {{}}}}}})
+app.apply_event({{"type": "sandbox_ready", "iteration": 2, "vulnerability_class": "idor",
+                   "payload": {{"sandbox_id": "sbox-2", "url": "https://b.daytona.io",
+                                "region": "us-west-1", "created_at": "t2", "spec": {{}}}}}})
+st.session_state['_history'] = list(st.session_state.sandbox_history)
+"""
+    at = AppTest.from_string(script)
+    at.run()
+    assert len(at.exception) == 0, at.exception
+    history = at.session_state["_history"]
+    assert len(history) == 2
+    assert history[0]["id"] == "sbox-1"
+    assert history[1]["id"] == "sbox-2"
+    assert history[0]["status"] == "running"
+
+
+def test_verified_marks_latest_sandbox_history_entry_verified():
+    script = f"""
+import sys
+sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})
+import streamlit as st
+from dashboard import app
+app.init_state()
+app.apply_event({{"type": "sandbox_ready", "iteration": 1, "vulnerability_class": "sqli",
+                   "payload": {{"sandbox_id": "sbox-1", "url": "https://a.daytona.io",
+                                "region": "us-east-1", "created_at": "t1", "spec": {{}}}}}})
+app.apply_event({{"type": "verified", "iteration": 1, "vulnerability_class": "sqli",
+                   "payload": {{"request": {_REQ!r}, "response": {_RESP!r}, "exploit_blocked": True}}}})
+st.session_state['_status'] = st.session_state.sandbox_history[-1]["status"]
+"""
+    at = AppTest.from_string(script)
+    at.run()
+    assert len(at.exception) == 0, at.exception
+    assert at.session_state["_status"] == "verified"
+
+
+def test_sandbox_destroyed_marks_matching_history_entry():
+    script = f"""
+import sys
+sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})
+import streamlit as st
+from dashboard import app
+app.init_state()
+app.apply_event({{"type": "sandbox_ready", "iteration": 1, "vulnerability_class": "sqli",
+                   "payload": {{"sandbox_id": "sbox-1", "url": "https://a.daytona.io",
+                                "region": "us-east-1", "created_at": "t1", "spec": {{}}}}}})
+app.apply_event({{"type": "sandbox_ready", "iteration": 2, "vulnerability_class": "idor",
+                   "payload": {{"sandbox_id": "sbox-2", "url": "https://b.daytona.io",
+                                "region": "us-west-1", "created_at": "t2", "spec": {{}}}}}})
+app.apply_event({{"type": "sandbox_destroyed", "iteration": 1, "vulnerability_class": "sqli",
+                   "payload": {{"sandbox_id": "sbox-1"}}}})
+st.session_state['_history'] = list(st.session_state.sandbox_history)
+"""
+    at = AppTest.from_string(script)
+    at.run()
+    assert len(at.exception) == 0, at.exception
+    history = at.session_state["_history"]
+    assert history[0]["status"] == "destroyed"
+    assert history[1]["status"] == "running"  # untouched
+
+
+def test_do_reset_clears_sandbox_history(tmp_path):
+    at = _run_reset_script(tmp_path, """
+app.init_state()
+st.session_state.sandbox_history = [{'id': 'sbox-1'}]
+with patch.object(app.subprocess, 'run'):
+    app.do_reset()
+st.session_state['_history'] = st.session_state.sandbox_history
+""")
+    assert len(at.exception) == 0, at.exception
+    assert at.session_state["_history"] == []
+
+
+# ---------------------------------------------------------------------------
+# _sbox_card_html
+# ---------------------------------------------------------------------------
+
+def test_sbox_card_html_includes_id_url_and_status():
+    html = app._sbox_card_html({
+        "id": "sbox-1", "url": "https://a.daytona.io", "region": "us-east-1",
+        "status": "running", "iteration": 1, "vuln_class": "sqli",
+    })
+    assert "sbox-1" in html
+    assert "https://a.daytona.io" in html
+    assert "running" in html
+    assert "us-east-1" in html
+
+
+def test_sbox_card_html_escapes_fields():
+    html = app._sbox_card_html({
+        "id": "<script>", "url": "https://a.daytona.io", "region": "",
+        "status": "running", "iteration": 1, "vuln_class": "",
+    })
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+
+
+def test_render_sidebar_shows_empty_state_with_no_sandboxes(tmp_path):
+    at = _run_reset_script(tmp_path, """
+app.init_state()
+app.render_sidebar()
+""")
+    assert len(at.exception) == 0, at.exception
+    html_bodies = [n.proto.body for n in at.get("html")]
+    assert any("Waiting for the first sandbox" in body for body in html_bodies)
+
+
+def test_render_sidebar_lists_all_sandboxes_most_recent_first(tmp_path):
+    at = _run_reset_script(tmp_path, """
+app.init_state()
+st.session_state.sandbox_history = [
+    {'id': 'sbox-1', 'url': 'https://a.daytona.io', 'region': 'us-east-1',
+     'status': 'destroyed', 'iteration': 1, 'vuln_class': 'sqli'},
+    {'id': 'sbox-2', 'url': 'https://b.daytona.io', 'region': 'us-west-1',
+     'status': 'running', 'iteration': 2, 'vuln_class': 'idor'},
+]
+app.render_sidebar()
+""")
+    assert len(at.exception) == 0, at.exception
+    html_bodies = [n.proto.body for n in at.get("html")]
+    joined = "".join(html_bodies)
+    assert "sbox-1" in joined and "sbox-2" in joined
+    # Most recent (sbox-2) rendered before sbox-1.
+    assert joined.index("sbox-2") < joined.index("sbox-1")
+
+
+# ---------------------------------------------------------------------------
+# render_feed — auto-scroll
+# ---------------------------------------------------------------------------
+
+def test_render_feed_includes_scroll_marker_and_script():
+    script = f"""
+import sys
+sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})
+import streamlit as st
+from dashboard import app
+app.init_state()
+st.session_state.iteration = 1
+st.session_state.vuln_class = "sqli"
+st.session_state.stage = "scanning"
+st.session_state.active_agent = "attacker"
+app.render_feed()
+"""
+    at = AppTest.from_string(script)
+    at.run()
+    assert len(at.exception) == 0, at.exception
+    # st.html() elements surface as UnknownElement — the rendered HTML is on
+    # .proto.body, not .value (which only applies to widget-shaped elements).
+    html_bodies = [n.proto.body for n in at.get("html")]
+    assert any("aos-feed-end" in body for body in html_bodies)
+    assert any("scrollIntoView" in body for body in html_bodies)
